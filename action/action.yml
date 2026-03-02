@@ -1,0 +1,65 @@
+name: 'LatentSpec Behavioral Regression Check'
+description: |
+  Compares your candidate trace set against a baseline using the agent's
+  discovered behavioral invariants. Fails the PR when severity-gated
+  regressions are detected (§4.2).
+author: 'LatentSpec'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  api-key:
+    description: 'LatentSpec API key (used when --invariants is fetched from the API).'
+    required: false
+  agent-id:
+    description: 'Agent ID to fetch active invariants for (when no --invariants file is provided).'
+    required: false
+  agent-name:
+    description: 'Display name used in the PR-comment header.'
+    required: false
+    default: 'agent'
+  invariants:
+    description: 'Path to a JSON file with a list of invariants. If omitted, fetched from the API.'
+    required: false
+  baseline:
+    description: 'Path to a JSON file with the baseline trace set.'
+    required: true
+  candidate:
+    description: 'Path to a JSON file with the candidate trace set.'
+    required: true
+  fail-on:
+    description: 'Severity gate: never|warn|any|high|critical.'
+    required: false
+    default: 'critical'
+  api-base:
+    description: 'LatentSpec API base URL (defaults to public SaaS).'
+    required: false
+    default: 'https://api.latentspec.dev'
+
+outputs:
+  report:
+    description: 'Rendered PR-comment body.'
+  exit-code:
+    description: 'The severity-gated exit code (0 = pass).'
+
+runs:
+  using: 'docker'
+  image: 'Dockerfile'
+  args:
+    - --api-key
+    - ${{ inputs.api-key }}
+    - --agent-id
+    - ${{ inputs.agent-id }}
+    - --agent-name
+    - ${{ inputs.agent-name }}
+    - --invariants
+    - ${{ inputs.invariants }}
+    - --baseline
+    - ${{ inputs.baseline }}
+    - --candidate
+    - ${{ inputs.candidate }}
+    - --fail-on
+    - ${{ inputs.fail-on }}
+    - --api-base
+    - ${{ inputs.api-base }}
