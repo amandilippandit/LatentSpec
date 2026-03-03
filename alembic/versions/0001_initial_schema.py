@@ -126,3 +126,132 @@ def upgrade() -> None:
         sa.Column(
             "severity",
             postgresql.ENUM(name="severity", create_type=False),
+            nullable=False,
+            server_default="medium",
+        ),
+        sa.Column(
+            "status",
+            postgresql.ENUM(name="invariant_status", create_type=False),
+            nullable=False,
+            server_default="pending",
+        ),
+        sa.Column(
+            "evidence_trace_ids",
+            postgresql.ARRAY(postgresql.UUID(as_uuid=True)),
+            nullable=False,
+            server_default="{}",
+        ),
+        sa.Column("evidence_count", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("violation_count", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("violation_rate", sa.Float, nullable=False, server_default="0"),
+        sa.Column(
+            "discovered_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column("last_checked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("description_embedding", Vector(INVARIANT_EMBEDDING_DIM), nullable=True),
+        sa.Column("discovered_by", sa.String(32), nullable=False, server_default="both"),
+        sa.Column("params", postgresql.JSONB, nullable=False, server_default="{}"),
+    )
+    op.create_index("ix_invariants_agent_status", "invariants", ["agent_id", "status"])
+    op.create_index("ix_invariants_agent_type", "invariants", ["agent_id", "type"])
+
+    # ---- violations ---------------------------------------------------
+    op.create_table(
+        "violations",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "invariant_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("invariants.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "trace_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("traces.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "detected_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column("details", postgresql.JSONB, nullable=False, server_default="{}"),
+        sa.Column(
+            "severity",
+            postgresql.ENUM(name="severity", create_type=False),
+            nullable=False,
+        ),
+        sa.Column("acknowledged", sa.Boolean, nullable=False, server_default="false"),
+    )
+    op.create_index(
+        "ix_violations_invariant_detected", "violations", ["invariant_id", "detected_at"]
+    )
+
+    # ---- mining_runs --------------------------------------------------
+    op.create_table(
+        "mining_runs",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column(
+            "agent_id",
+            postgresql.UUID(as_uuid=True),
+            sa.ForeignKey("agents.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "started_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.func.now(),
+            nullable=False,
+        ),
+        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("traces_analyzed", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("invariants_discovered", sa.Integer, nullable=False, server_default="0"),
+        sa.Column("config", postgresql.JSONB, nullable=False, server_default="{}"),
+        sa.Column(
+            "status",
+            postgresql.ENUM(name="mining_run_status", create_type=False),
+            nullable=False,
+            server_default="pending",
+        ),
+        sa.Column("error", sa.Text, nullable=True),
+    )
+
+    # ---- §8.2 retention policies (TimescaleDB compression + drop) -----
+    # 30-day hot, 90-day warm; cold tier (>90d) is paywalled enterprise feature
+    # and is implemented out-of-band against object storage, not Postgres.
+    op.execute(
+        "ALTER TABLE traces SET ("
+        "timescaledb.compress, "
+        "timescaledb.compress_segmentby = 'agent_id'"
+        ")"
+    )
+    op.execute("SELECT add_compression_policy('traces', INTERVAL '30 days')")
+    op.execute("SELECT add_retention_policy('traces', INTERVAL '90 days')")
+
+
+def downgrade() -> None:
+    op.execute("SELECT remove_retention_policy('traces', if_exists => TRUE)")
+    op.execute("SELECT remove_compression_policy('traces', if_exists => TRUE)")
+    op.drop_table("mining_runs")
+    op.drop_index("ix_violations_invariant_detected", table_name="violations")
+    op.drop_table("violations")
+    op.drop_index("ix_invariants_agent_type", table_name="invariants")
+    op.drop_index("ix_invariants_agent_status", table_name="invariants")
+    op.drop_table("invariants")
+    op.drop_index("ix_traces_version", table_name="traces")
+    op.drop_index("ix_traces_agent_started", table_name="traces")
+    op.drop_table("traces")
+    op.drop_table("agents")
+    for enum_name in (
+        "mining_run_status",
+        "invariant_status",
+        "severity",
+        "invariant_type",
+        "trace_status",
+    ):
+        op.execute(f"DROP TYPE IF EXISTS {enum_name}")
