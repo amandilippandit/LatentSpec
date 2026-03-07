@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 250 250 252;
+  --foreground: 9 9 11;
+}
+
+html,
+body {
+  background: rgb(var(--background));
+  color: rgb(var(--foreground));
+  font-family: "Inter", system-ui, sans-serif;
+}
+
+.glass {
+  @apply bg-white/80 backdrop-blur border border-zinc-200 rounded-xl shadow-sm;
+}
+
+/* Severity pills — used across views */
+.pill {
+  @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium;
+}
+.pill-critical { @apply bg-red-100 text-red-700; }
+.pill-high     { @apply bg-orange-100 text-orange-700; }
+.pill-medium   { @apply bg-amber-100 text-amber-700; }
+.pill-low      { @apply bg-zinc-100 text-zinc-700; }
+
+.status-active   { @apply bg-emerald-100 text-emerald-700; }
+.status-pending  { @apply bg-amber-100 text-amber-800; }
+.status-rejected { @apply bg-zinc-100 text-zinc-500 line-through; }
