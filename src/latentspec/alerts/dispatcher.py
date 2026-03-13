@@ -67,3 +67,72 @@ class AlertSink(ABC):
 
     @abstractmethod
     async def send(self, event: AlertEvent) -> None:
+        ...
+
+
+class AlertDispatcher:
+    def __init__(self) -> None:
+        self._sinks: list[AlertSink] = []
+        self._buckets: dict[tuple[str, str], list[float]] = defaultdict(list)
+
+    def register(self, sink: AlertSink) -> None:
+        self._sinks.append(sink)
+
+    def remove_all(self) -> None:
+        self._sinks.clear()
+
+    def sinks(self) -> list[AlertSink]:
+        return list(self._sinks)
+
+    async def dispatch(self, event: AlertEvent) -> None:
+        if not self._sinks:
+            return
+        await asyncio.gather(*(self._send_with_retry(s, event) for s in self._sinks))
+
+    async def _send_with_retry(self, sink: AlertSink, event: AlertEvent) -> None:
+        if not self._allow(sink, event.agent_id):
+            log.info("rate-limited %s for agent %s", sink.name, event.agent_id)
+            return
+
+        attempt = 0
+        delay = sink.base_backoff_s
+        while attempt < sink.max_attempts:
+            try:
+                await sink.send(event)
+                return
+            except Exception as e:  # noqa: BLE001
+                attempt += 1
+                if attempt >= sink.max_attempts:
+                    log.warning(
+                        "%s gave up after %d attempts: %s",
+                        sink.name,
+                        attempt,
+                        e,
+                    )
+                    return
+                # Exponential backoff with full jitter
+                jitter = random.uniform(0, delay)
+                await asyncio.sleep(delay + jitter)
+                delay *= 2
+
+    def _allow(self, sink: AlertSink, agent_id: str) -> bool:
+        bucket = self._buckets[(sink.name, agent_id)]
+        now = time.time()
+        cutoff = now - 60.0
+        # drop expired hits
+        while bucket and bucket[0] < cutoff:
+            bucket.pop(0)
+        if len(bucket) >= sink.rate_limit_per_min:
+            return False
+        bucket.append(now)
+        return True
+
+
+_singleton: AlertDispatcher | None = None
+
+
+def get_dispatcher() -> AlertDispatcher:
+    global _singleton
+    if _singleton is None:
+        _singleton = AlertDispatcher()
+    return _singleton
