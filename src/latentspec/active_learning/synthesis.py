@@ -116,3 +116,121 @@ class SyntheticTraceGenerator:
                 "n_traces": n_traces,
             },
             ensure_ascii=False,
+        )
+        try:
+            resp = await client.messages.create(
+                model=self.model or settings.anthropic_model,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_message}],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("synthetic generation failed: %s", e)
+            return []
+
+        text = "".join(getattr(b, "text", "") or "" for b in resp.content).strip()
+        return _parse_traces(text)
+
+
+def _parse_traces(raw: str) -> list[NormalizedTrace]:
+    if not raw:
+        return []
+    cleaned = raw
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:]
+    start = cleaned.find("[")
+    end = cleaned.rfind("]")
+    if start == -1 or end == -1:
+        # Sometimes Claude returns an object with `traces` key
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start == -1 or end == -1:
+            return []
+        try:
+            obj = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+        items = obj.get("traces") or []
+    else:
+        try:
+            items = json.loads(cleaned[start : end + 1])
+        except json.JSONDecodeError:
+            return []
+
+    out: list[NormalizedTrace] = []
+    for item in items:
+        try:
+            out.append(NormalizedTrace.model_validate(item))
+        except ValidationError as e:
+            log.debug("dropping malformed synthetic trace: %s", e)
+            continue
+    return out
+
+
+async def generate_synthetic_traces(
+    spec: AgentSpec, *, n_traces: int = 20
+) -> list[NormalizedTrace]:
+    """Module-level convenience: one shot, returns parsed traces."""
+    return await SyntheticTraceGenerator().generate(spec, n_traces=n_traces)
+
+
+# ---- Deterministic generator for tests / no-API-key environments --------
+
+
+def deterministic_synthetic_traces(
+    spec: AgentSpec, *, n_traces: int = 20, seed: int = 13
+) -> list[NormalizedTrace]:
+    """Pure-Python fallback that emits structurally plausible traces.
+
+    No LLM calls. Useful for unit tests and air-gapped deployments where
+    Anthropic API access isn't available.
+    """
+    import random
+
+    from latentspec.schemas.trace import (
+        AgentResponseStep,
+        ToolCallStep,
+        UserInputStep,
+    )
+
+    rng = random.Random(seed)
+    traces: list[NormalizedTrace] = []
+    inputs = spec.sample_user_inputs or [f"Help me with {spec.purpose}"]
+    segments = spec.user_segments or ["default"]
+
+    for i in range(n_traces):
+        n_steps = rng.randint(*spec.typical_session_length)
+        user_input = rng.choice(inputs)
+        segment = rng.choice(segments)
+        steps: list[Any] = [UserInputStep(content=user_input)]
+        # Synthesize a plausible chain by sampling tools sequentially.
+        used_tools = []
+        for _ in range(min(n_steps - 2, len(spec.tools))):
+            tool = rng.choice(spec.tools)
+            steps.append(
+                ToolCallStep(
+                    tool=tool,
+                    args={"step": len(used_tools)},
+                    latency_ms=rng.randint(30, 800),
+                    result_status="success" if rng.random() > 0.01 else "error",
+                )
+            )
+            used_tools.append(tool)
+        steps.append(AgentResponseStep(content=f"Done with {spec.purpose}."))
+
+        traces.append(
+            NormalizedTrace(
+                trace_id=f"synth-{uuid.uuid4().hex[:10]}",
+                agent_id=spec.name.lower().replace(" ", "-"),
+                timestamp=datetime.now(UTC) - timedelta(minutes=rng.randint(0, 5000)),
+                ended_at=datetime.now(UTC),
+                steps=steps,
+                metadata=TraceMetadata(
+                    user_segment=segment, version="synthetic-v1"
+                ),
+            )
+        )
+    return traces
