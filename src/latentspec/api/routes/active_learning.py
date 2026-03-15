@@ -82,3 +82,88 @@ async def synthesize_traces(
             payload.spec.get("typical_session_length") or (3, 8)
         ),  # type: ignore[arg-type]
     )
+
+    traces: list[NormalizedTrace]
+    if payload.use_llm:
+        try:
+            traces = await generate_synthetic_traces(spec, n_traces=payload.n_traces)
+        except Exception:
+            traces = []
+    else:
+        traces = []
+
+    if not traces:
+        traces = deterministic_synthetic_traces(spec, n_traces=payload.n_traces)
+
+    out: list[SynthesizedItemOut] = []
+    for t in traces:
+        row = SyntheticReviewItem(
+            agent_id=agent_id,
+            spec_name=spec.name,
+            trace_data=t.model_dump(mode="json"),
+            decision=ReviewDecision.PENDING,
+        )
+        db.add(row)
+        await db.flush()
+        await db.refresh(row)
+        out.append(SynthesizedItemOut.from_row(row))
+    return out
+
+
+@router.get(
+    "/agents/{agent_id}/active-learning/queue",
+    response_model=list[SynthesizedItemOut],
+)
+async def list_queue(
+    agent_id: uuid.UUID,
+    decision: ReviewDecision | None = None,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+) -> list[SynthesizedItemOut]:
+    stmt = (
+        select(SyntheticReviewItem)
+        .where(SyntheticReviewItem.agent_id == agent_id)
+        .order_by(SyntheticReviewItem.created_at.desc())
+        .limit(limit)
+    )
+    if decision is not None:
+        stmt = stmt.where(SyntheticReviewItem.decision == decision)
+    rows = list((await db.execute(stmt)).scalars().all())
+    return [SynthesizedItemOut.from_row(r) for r in rows]
+
+
+class DecisionIn(BaseModel):
+    decision: ReviewDecision
+    decided_by: str | None = None
+    edit_notes: str | None = None
+    replacement_trace: dict[str, Any] | None = None
+
+
+@router.patch(
+    "/active-learning/queue/{item_id}",
+    response_model=SynthesizedItemOut,
+)
+async def decide_item(
+    item_id: uuid.UUID,
+    payload: DecisionIn,
+    db: AsyncSession = Depends(get_db),
+) -> SynthesizedItemOut:
+    row = await db.get(SyntheticReviewItem, item_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="queue item not found")
+    row.decision = payload.decision
+    row.decided_at = datetime.now(UTC)
+    row.decided_by = payload.decided_by
+    row.edit_notes = payload.edit_notes
+    if payload.replacement_trace and payload.decision == ReviewDecision.EDITED:
+        # Validate the replacement against the §3.2 schema before persisting
+        try:
+            NormalizedTrace.model_validate(payload.replacement_trace)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400, detail=f"replacement trace invalid: {e}"
+            ) from e
+        row.trace_data = payload.replacement_trace
+    await db.flush()
+    await db.refresh(row)
+    return SynthesizedItemOut.from_row(row)
