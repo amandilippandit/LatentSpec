@@ -70,3 +70,76 @@ async def list_orgs(db: AsyncSession = Depends(get_db)) -> list[Organization]:
 
 
 class ApiKeyIn(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+
+
+class ApiKeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    org_id: uuid.UUID
+    name: str
+    prefix: str
+    revoked_at: datetime | None
+    last_used_at: datetime | None
+    created_at: datetime
+
+
+class ApiKeyCreatedOut(ApiKeyOut):
+    """Same shape as ApiKeyOut plus the plaintext key — shown ONCE at creation."""
+
+    plaintext: str
+
+
+@router.post("/orgs/{org_id}/api-keys", response_model=ApiKeyCreatedOut, status_code=201)
+async def create_api_key(
+    org_id: uuid.UUID,
+    payload: ApiKeyIn,
+    db: AsyncSession = Depends(get_db),
+) -> ApiKeyCreatedOut:
+    org = await db.get(Organization, org_id)
+    if org is None:
+        raise HTTPException(status_code=404, detail="organization not found")
+
+    generated = generate_api_key()
+    row = ApiKey(
+        org_id=org_id,
+        name=payload.name,
+        prefix=generated.prefix,
+        hash_hex=generated.hash_hex,
+    )
+    db.add(row)
+    await db.flush()
+    await db.refresh(row)
+
+    return ApiKeyCreatedOut(
+        id=row.id,
+        org_id=row.org_id,
+        name=row.name,
+        prefix=row.prefix,
+        revoked_at=row.revoked_at,
+        last_used_at=row.last_used_at,
+        created_at=row.created_at,
+        plaintext=generated.plaintext,
+    )
+
+
+@router.get("/orgs/{org_id}/api-keys", response_model=list[ApiKeyOut])
+async def list_api_keys(
+    org_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> list[ApiKey]:
+    result = await db.execute(
+        select(ApiKey).where(ApiKey.org_id == org_id).order_by(ApiKey.created_at.desc())
+    )
+    return list(result.scalars().all())
+
+
+@router.delete("/api-keys/{key_id}", status_code=204)
+async def revoke_api_key(
+    key_id: uuid.UUID, db: AsyncSession = Depends(get_db)
+) -> None:
+    row = await db.get(ApiKey, key_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="api key not found")
+    row.revoked_at = datetime.now(timezone.utc)
+    await db.flush()
