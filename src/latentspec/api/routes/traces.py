@@ -213,3 +213,218 @@ def _detect_format(payload: dict[str, Any]) -> str | None:
         return "raw_json"
     return None
 
+
+def _normalize_dag_payload(payload: dict[str, Any], *, agent_id: str) -> NormalizedTrace:
+    dag = DagTrace.model_validate(
+        {
+            "trace_id": payload.get("trace_id") or f"dag-{uuid.uuid4().hex[:10]}",
+            "agent_id": payload.get("agent_id") or agent_id,
+            **payload,
+        }
+    )
+    return dag.to_linear()
+
+
+# ---- output models -----------------------------------------------------
+
+
+class TraceAcceptedOut(BaseModel):
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    step_count: int
+    status: str
+    fingerprint: str
+    cluster_id: int | None = None
+
+
+# ---- ingest path -------------------------------------------------------
+
+
+async def _persist(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    normalized: NormalizedTrace,
+    *,
+    version_tag: str | None,
+    session_id: str | None,
+    user_id: str | None,
+) -> Trace:
+    agent = await db.get(Agent, agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent not found")
+
+    # ---- canonicalise tool names ---------------------------------------
+    aliases = await _alias_map_for(db, agent_id)
+    if aliases:
+        normalized = apply_alias_map(normalized, aliases)
+
+    # ---- compute fingerprint + cluster routing -------------------------
+    fp = fingerprint(normalized)
+    cluster_id = await _route_to_cluster(db, agent_id, normalized)
+
+    trace = Trace(
+        agent_id=agent_id,
+        trace_data=normalized.model_dump(mode="json"),
+        version_tag=version_tag or normalized.metadata.version,
+        session_id=session_id,
+        user_id=user_id,
+        cluster_id=cluster_id,
+        fingerprint=fp,
+        started_at=normalized.timestamp,
+        ended_at=normalized.ended_at,
+        step_count=len(normalized.steps),
+        status=TraceStatus.SUCCESS,
+    )
+    db.add(trace)
+    await db.flush()
+    await db.refresh(trace)
+
+    # ---- register / update agent version -------------------------------
+    effective_version = version_tag or normalized.metadata.version
+    if effective_version:
+        try:
+            await register_or_update_version(
+                db,
+                agent_id=agent_id,
+                version_tag=str(effective_version),
+                trace=normalized,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("version tracking failed: %s", e)
+
+    # ---- update fingerprint baseline (drift signal) --------------------
+    try:
+        await _update_fingerprint_baseline(db, agent_id, fp)
+    except Exception as e:  # noqa: BLE001
+        log.debug("fingerprint baseline update failed: %s", e)
+
+    # ---- streaming detection -------------------------------------------
+    counter("latentspec_traces_ingested_total", labels={"agent_id": str(agent_id)})
+    try:
+        sr = await _detector.check(
+            agent_id=str(agent_id),
+            trace=normalized,
+            loader=_load_active_invariants,
+        )
+        histogram(
+            "latentspec_streaming_check_seconds",
+            sr.duration_ms / 1000.0,
+            labels={"agent_id": str(agent_id)},
+        )
+        if sr.failed:
+            counter(
+                "latentspec_violations_total",
+                labels={"agent_id": str(agent_id), "outcome": "fail"},
+                value=sr.failed,
+            )
+        if sr.warned:
+            counter(
+                "latentspec_violations_total",
+                labels={"agent_id": str(agent_id), "outcome": "warn"},
+                value=sr.warned,
+            )
+    except Exception as e:  # noqa: BLE001
+        log.debug("streaming detection failed (fail-open): %s", e)
+
+    return trace
+
+
+@router.post(
+    "",
+    response_model=TraceAcceptedOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def ingest_trace(
+    payload: TraceIn,
+    db: AsyncSession = Depends(get_db),
+) -> TraceAcceptedOut:
+    """Accept and normalise a single agent trace.
+
+    Format dispatch in priority order:
+      1. Explicit `format` in the payload header (`raw_json`, `langchain`, `dag`).
+      2. Auto-detect from payload shape.
+      3. Fall back to raw_json.
+    """
+    fmt = payload.format if payload.format != "normalized" else None
+    if fmt is None:
+        fmt = _detect_format(payload.payload) or "raw_json"
+
+    try:
+        if fmt == "dag":
+            normalized = _normalize_dag_payload(
+                payload.payload, agent_id=str(payload.agent_id)
+            )
+        else:
+            normalized = registry.normalize(
+                fmt, payload.payload, agent_id=str(payload.agent_id)
+            )
+    except NormalizerError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"failed to normalise: {e}") from e
+
+    session_id = payload.payload.get("session_id") if isinstance(payload.payload, dict) else None
+    user_id = payload.payload.get("user_id") if isinstance(payload.payload, dict) else None
+
+    trace = await _persist(
+        db, payload.agent_id, normalized,
+        version_tag=payload.version_tag,
+        session_id=session_id,
+        user_id=user_id,
+    )
+    return TraceAcceptedOut(
+        id=trace.id,
+        agent_id=trace.agent_id,
+        step_count=trace.step_count,
+        status=trace.status.value,
+        fingerprint=trace.fingerprint or "",
+        cluster_id=trace.cluster_id,
+    )
+
+
+class TraceBatchIn(BaseModel):
+    traces: list[TraceIn]
+
+
+@router.post(
+    "/batch",
+    response_model=list[TraceAcceptedOut],
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def ingest_batch(
+    payload: TraceBatchIn,
+    db: AsyncSession = Depends(get_db),
+) -> list[TraceAcceptedOut]:
+    out: list[TraceAcceptedOut] = []
+    for item in payload.traces:
+        fmt = item.format if item.format != "normalized" else None
+        if fmt is None:
+            fmt = _detect_format(item.payload) or "raw_json"
+        try:
+            if fmt == "dag":
+                normalized = _normalize_dag_payload(item.payload, agent_id=str(item.agent_id))
+            else:
+                normalized = registry.normalize(
+                    fmt, item.payload, agent_id=str(item.agent_id)
+                )
+        except (NormalizerError, Exception) as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        sid = item.payload.get("session_id") if isinstance(item.payload, dict) else None
+        uid = item.payload.get("user_id") if isinstance(item.payload, dict) else None
+        trace = await _persist(
+            db, item.agent_id, normalized,
+            version_tag=item.version_tag,
+            session_id=sid,
+            user_id=uid,
+        )
+        out.append(
+            TraceAcceptedOut(
+                id=trace.id,
+                agent_id=trace.agent_id,
+                step_count=trace.step_count,
+                status=trace.status.value,
+                fingerprint=trace.fingerprint or "",
+                cluster_id=trace.cluster_id,
+            )
+        )
+    return out
