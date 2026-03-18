@@ -77,3 +77,82 @@ async def get_session(
 ) -> SessionModel:
     row = await db.get(SessionModel, session_id)
     if row is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return row
+
+
+class SessionMiningOut(BaseModel):
+    n_sessions: int
+    n_transitions: int
+    n_aggregates: int
+    n_terminations: int
+    sample_invariants: list[dict[str, Any]]
+
+
+@router.post("/agents/{agent_id}/session-mining", response_model=SessionMiningOut)
+async def trigger_session_mining(
+    agent_id: uuid.UUID,
+    limit_sessions: int = 200,
+    db: AsyncSession = Depends(get_db),
+) -> SessionMiningOut:
+    """Build sessions from `Session` rows + correlated `Trace` rows, then mine."""
+    session_rows = (
+        await db.execute(
+            select(SessionModel)
+            .where(SessionModel.agent_id == agent_id)
+            .order_by(SessionModel.started_at.desc())
+            .limit(limit_sessions)
+        )
+    ).scalars().all()
+
+    sessions: list[SessionSchema] = []
+    for s_row in session_rows:
+        # Find traces tagged with this session's id (string form)
+        traces = (
+            await db.execute(
+                select(Trace)
+                .where(Trace.agent_id == agent_id)
+                .where(Trace.session_id == str(s_row.id))
+                .order_by(Trace.started_at.asc())
+            )
+        ).scalars().all()
+        if not traces:
+            continue
+        sessions.append(
+            SessionSchema(
+                session_id=str(s_row.id),
+                agent_id=str(agent_id),
+                user_id=s_row.user_id,
+                started_at=s_row.started_at,
+                ended_at=s_row.ended_at,
+                turns=[NormalizedTrace.model_validate(t.trace_data) for t in traces],
+            )
+        )
+
+    if not sessions:
+        return SessionMiningOut(
+            n_sessions=0, n_transitions=0, n_aggregates=0, n_terminations=0,
+            sample_invariants=[],
+        )
+
+    result = mine_session_invariants(sessions)
+
+    samples = []
+    for c in (result.transitions + result.aggregates + result.terminations)[:10]:
+        samples.append(
+            {
+                "type": c.type.value,
+                "description": c.description,
+                "support": c.support,
+                "consistency": c.consistency,
+                "session_level": True,
+            }
+        )
+
+    return SessionMiningOut(
+        n_sessions=result.n_sessions,
+        n_transitions=len(result.transitions),
+        n_aggregates=len(result.aggregates),
+        n_terminations=len(result.terminations),
+        sample_invariants=samples,
+    )
