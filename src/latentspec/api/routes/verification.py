@@ -68,3 +68,73 @@ async def run_verification(
         .where(Trace.agent_id == inv.agent_id)
         .order_by(Trace.started_at.desc())
         .limit(payload.sample_size)
+    )
+    if payload.version_tag is not None:
+        stmt = stmt.where(Trace.version_tag == payload.version_tag)
+    rows = list((await db.execute(stmt)).scalars().all())
+    if not rows:
+        raise HTTPException(status_code=400, detail="no traces available for this agent")
+
+    holds = 0
+    violates = 0
+    counters: list[dict] = []
+    for row in rows:
+        nt = NormalizedTrace.model_validate(row.trace_data)
+        result = verify_trace(compilation, nt, timeout_ms=payload.timeout_ms_per_trace)
+        if result.holds:
+            holds += 1
+        else:
+            violates += 1
+            if result.counter_example is not None and len(counters) < 3:
+                counters.append(
+                    {"trace_id": nt.trace_id, "counter_example": result.counter_example}
+                )
+
+    n = holds + violates
+    return VerifyOut(
+        invariant_id=str(invariant_id),
+        sample_size=n,
+        holds=holds,
+        violates=violates,
+        pass_rate=round(holds / max(1, n), 4),
+        counter_examples=counters,
+    )
+
+
+@router.post("/{invariant_id}/certificate")
+async def issue_certificate(
+    invariant_id: uuid.UUID,
+    payload: VerifyIn,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """§10.1 — premium enterprise certificate. Hidden surface today."""
+    inv = await db.get(Invariant, invariant_id)
+    if inv is None:
+        raise HTTPException(status_code=404, detail="invariant not found")
+    try:
+        compilation = compile_invariant(inv.type, dict(inv.params or {}))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"compile failed: {e}") from e
+
+    rows = list(
+        (
+            await db.execute(
+                select(Trace)
+                .where(Trace.agent_id == inv.agent_id)
+                .order_by(Trace.started_at.desc())
+                .limit(payload.sample_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    sample = [NormalizedTrace.model_validate(r.trace_data) for r in rows]
+    if not sample:
+        raise HTTPException(status_code=400, detail="no traces available")
+
+    cert = generate_certificate(
+        compilation,
+        sample,
+        timeout_ms_per_trace=payload.timeout_ms_per_trace,
+    )
+    return asdict(cert)
