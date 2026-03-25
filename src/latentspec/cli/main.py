@@ -164,3 +164,170 @@ def _load_invariants(path: Path) -> list[InvariantSpec]:
             InvariantSpec(
                 id=str(item.get("invariant_id") or item.get("id") or uuid.uuid4().hex),
                 type=InvariantType(item["type"]),
+                description=item["description"],
+                formal_rule=item.get("formal_rule") or "",
+                severity=Severity(item.get("severity", "medium")),
+                params=item.get("params") or {},
+            )
+        )
+    return out
+
+
+@cli.command()
+@click.option(
+    "--invariants",
+    "invariants_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="JSON list of invariants (output of `latentspec mine --out …`).",
+)
+@click.option(
+    "--baseline",
+    "baseline_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="JSON list of baseline traces (the known-good population).",
+)
+@click.option(
+    "--candidate",
+    "candidate_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="JSON list of candidate traces (the new population to check).",
+)
+@click.option("--agent-name", default="agent", help="Used in the report header.")
+@click.option(
+    "--fail-on",
+    type=click.Choice(["never", "warn", "any", "high", "critical"]),
+    default="critical",
+    help="Severity gate that controls the exit code.",
+)
+@click.option(
+    "--format",
+    "output_format",
+    type=click.Choice(["pr", "terminal", "json"]),
+    default="terminal",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Write the rendered report to this file (in addition to stdout).",
+)
+def check(
+    invariants_path: Path,
+    baseline_path: Path,
+    candidate_path: Path,
+    agent_name: str,
+    fail_on: str,
+    output_format: str,
+    output_path: Path | None,
+) -> None:
+    """Run a behavioral regression check (§4.1 batch + §4.2 PR comment).
+
+    Returns exit 1 when the configured severity gate is breached, exit 0
+    otherwise — making it directly usable as a CI step.
+    """
+    invariants = _load_invariants(invariants_path)
+    baseline = _load_traces(baseline_path)
+    candidate = _load_traces(candidate_path)
+
+    console.print(
+        f"Checking [bold]{len(invariants)}[/bold] invariants "
+        f"against [bold]{len(baseline)}[/bold] baseline + "
+        f"[bold]{len(candidate)}[/bold] candidate traces…"
+    )
+    report = compare_trace_sets(invariants, baseline, candidate)
+
+    if output_format == "json":
+        payload = {
+            "invariants_checked": report.invariants_checked,
+            "passes": report.passes,
+            "warnings": [_summary_dict(s) for s in report.warnings],
+            "failures": [_summary_dict(s) for s in report.failures],
+            "counts": report.counts,
+        }
+        text = json.dumps(payload, indent=2, ensure_ascii=False)
+    elif output_format == "pr":
+        text = format_pr_comment(report, agent_name=agent_name)
+    else:
+        text = format_terminal(report, agent_name=agent_name)
+
+    click.echo(text)
+    if output_path is not None:
+        output_path.write_text(text)
+        console.print(f"[dim]Wrote report to {output_path}[/dim]")
+
+    from latentspec.regression.batch import _exit_code_for
+
+    sys.exit(_exit_code_for(report, fail_on))
+
+
+# ----- export-promptfoo (week 3) -----------------------------------------
+
+
+@cli.command(name="export-promptfoo")
+@click.option(
+    "--invariants",
+    "invariants_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    required=True,
+    help="JSON list of invariants (output of `latentspec mine --out …`).",
+)
+@click.option(
+    "--out",
+    "out_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Optional path to write the generated promptfoo.yaml.",
+)
+@click.option(
+    "--include",
+    type=click.Choice(["active", "all"]),
+    default="active",
+    help="Which invariants to include: only active ones, or every status.",
+)
+def export_promptfoo_cmd(
+    invariants_path: Path, out_path: Path | None, include: str
+) -> None:
+    """Generate a promptfoo.yaml from a discovered invariant set (§2.2)."""
+    raw = json.loads(invariants_path.read_text())
+    if not isinstance(raw, list):
+        raise click.ClickException(f"{invariants_path} must contain a JSON list")
+
+    invariants: list[MinedInvariant] = [MinedInvariant.model_validate(item) for item in raw]
+    if include == "active":
+        invariants = [
+            inv for inv in invariants if inv.status == InvariantStatus.ACTIVE
+        ]
+
+    yaml_text = export_promptfoo(invariants)
+    if out_path is not None:
+        out_path.write_text(yaml_text)
+        console.print(
+            f"[green]Exported {len(invariants)} invariants to {out_path}[/green]"
+        )
+    else:
+        click.echo(yaml_text)
+
+
+def _summary_dict(s) -> dict:
+    return {
+        "invariant_id": s.invariant_id,
+        "type": s.type.value,
+        "description": s.description,
+        "severity": s.severity.value,
+        "applicable": s.applicable,
+        "passed": s.passed,
+        "failed": s.failed,
+        "warned": s.warned,
+        "pass_rate": s.pass_rate,
+        "fail_rate": s.fail_rate,
+        "warn_rate": s.warn_rate,
+        "sample_failure_traces": s.sample_failure_traces,
+    }
+
+
+if __name__ == "__main__":
+    cli()
