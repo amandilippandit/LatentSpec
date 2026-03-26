@@ -110,3 +110,116 @@ def _build_trace(idx: int) -> NormalizedTrace:
         steps.append(
             ToolCallStep(
                 tool="check_inventory",
+                args={"flight_id": f"FL{random.randint(1000, 9999)}"},
+                latency_ms=_latency(140),
+                result_status="success",
+            )
+        )
+        steps.append(
+            ToolCallStep(
+                tool="create_order",
+                args={"flight_id": f"FL{random.randint(1000, 9999)}"},
+                latency_ms=_latency(180),
+                result_status="success",
+            )
+        )
+
+        # Implant 5 — tool selection by segment
+        payments_tool = "payments_v2" if segment == "EU" else "payments_v1"
+        steps.append(
+            ToolCallStep(
+                tool=payments_tool,
+                args={"amount": random.randint(100, 900)},
+                latency_ms=_latency(260),
+                result_status="success" if random.random() > 0.01 else "error",
+            )
+        )
+
+        # Implant 6 — statistical: book_flight succeeds reliably
+        book_success = random.random() > 0.005
+        steps.append(
+            ToolCallStep(
+                tool="book_flight",
+                args={"flight_id": f"FL{random.randint(1000, 9999)}"},
+                latency_ms=_latency(310),
+                result_status="success" if book_success else "error",
+            )
+        )
+
+        # Implant 7 — composition: notify_user always follows successful booking
+        if book_success:
+            steps.append(
+                ToolCallStep(
+                    tool="notify_user",
+                    args={"channel": "email"},
+                    latency_ms=_latency(90),
+                    result_status="success",
+                )
+            )
+
+        # Implant 8 — state: session_close terminates the trace
+        steps.append(
+            ToolCallStep(
+                tool="session_close",
+                args={},
+                latency_ms=_latency(20),
+                result_status="success",
+            )
+        )
+
+        if is_japanese:
+            steps.append(
+                AgentResponseStep(
+                    content="ご予約が完了しました。確認メールをお送りしました。"
+                )
+            )
+        else:
+            steps.append(
+                AgentResponseStep(content="Your booking is confirmed. Check your email.")
+            )
+    else:
+        # Implant 9 — output format: pricing answers cite live pricing data
+        steps.append(
+            ToolCallStep(
+                tool="lookup_pricing",
+                args={"route": user_text},
+                latency_ms=_latency(110),
+                result_status="success",
+            )
+        )
+        steps.append(
+            AgentResponseStep(
+                content=(
+                    "According to current pricing data, fares range from $189 to $645. "
+                    "Note: prices reflect the live fare database."
+                )
+            )
+        )
+
+    return _wrap(idx, steps, segment, is_japanese)
+
+
+def _wrap(idx: int, steps: list[TraceStep], segment: str, is_japanese: bool) -> NormalizedTrace:
+    started_at = datetime.now(UTC) - timedelta(minutes=random.randint(0, 60 * 24 * 14))
+    duration_ms = sum(getattr(s, "latency_ms", 0) or 0 for s in steps)
+    ended_at = started_at + timedelta(milliseconds=duration_ms)
+
+    return NormalizedTrace(
+        trace_id=f"trace-{idx:05d}-{uuid.uuid4().hex[:6]}",
+        agent_id="booking-agent-v2",
+        timestamp=started_at,
+        ended_at=ended_at,
+        steps=steps,
+        metadata=TraceMetadata(
+            model="claude-sonnet-4-5",
+            version="v2.1",
+            user_segment=segment,
+            locale="ja-JP" if is_japanese else "en-US",
+        ),
+    )
+
+
+def generate_traces(n: int, *, seed: int = 42) -> list[NormalizedTrace]:
+    """Produce `n` synthetic booking-agent traces with reproducible seeding."""
+    random.seed(seed)
+    return [_build_trace(i) for i in range(n)]
