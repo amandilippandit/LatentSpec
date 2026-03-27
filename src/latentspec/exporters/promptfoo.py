@@ -136,3 +136,141 @@ def _render_test_block(inv: MinedInvariant) -> str:
             )
 
     if inv.type == InvariantType.OUTPUT_FORMAT:
+        return _block(
+            label,
+            severity=inv.severity.value,
+            inv_type=inv.type.value,
+            assertions=[
+                {
+                    "type": "llm-rubric",
+                    "value": inv.description,
+                }
+            ],
+        )
+
+    if inv.type == InvariantType.TOOL_SELECTION:
+        tool = p.get("tool", "")
+        return _block(
+            label,
+            severity=inv.severity.value,
+            inv_type=inv.type.value,
+            assertions=[
+                {"type": "javascript", "value": _js_tool_used(tool)},
+            ],
+        )
+
+    if inv.type in (InvariantType.STATE, InvariantType.COMPOSITION):
+        return _block(
+            label,
+            severity=inv.severity.value,
+            inv_type=inv.type.value,
+            assertions=[
+                {"type": "llm-rubric", "value": inv.description},
+            ],
+        )
+
+    return ""
+
+
+# ----- YAML helpers --------------------------------------------------------
+
+
+def _yaml_str(value: str) -> str:
+    if any(ch in value for ch in ":#\n\"'"):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return value
+
+
+def _block(
+    label: str,
+    *,
+    severity: str,
+    inv_type: str,
+    vars: dict[str, Any] | None = None,
+    assertions: list[dict[str, Any]] | None = None,
+) -> str:
+    lines = [
+        f"  - description: {_yaml_str(label)}",
+        f"    metadata:",
+        f"      latentspec_severity: {severity}",
+        f"      latentspec_type: {inv_type}",
+    ]
+    if vars:
+        lines.append("    vars:")
+        for k, v in vars.items():
+            lines.append(f"      {k}: {_yaml_str(str(v))}")
+    if assertions:
+        lines.append("    assert:")
+        for a in assertions:
+            lines.append(f"      - type: {a['type']}")
+            for key, val in a.items():
+                if key == "type":
+                    continue
+                if isinstance(val, list):
+                    lines.append(f"        {key}:")
+                    for item in val:
+                        lines.append(f"          - {_yaml_str(str(item))}")
+                elif isinstance(val, str) and "\n" in val:
+                    lines.append(f"        {key}: |")
+                    for vl in val.splitlines():
+                        lines.append(f"          {vl}")
+                else:
+                    lines.append(f"        {key}: {_yaml_str(str(val))}")
+    return "\n".join(lines)
+
+
+# ----- JavaScript assertion bodies -----------------------------------------
+
+
+def _js_ordering(tool_a: str, tool_b: str) -> str:
+    return (
+        "(output, context) => {\n"
+        f"  const a = {tool_a!r}; const b = {tool_b!r};\n"
+        "  const calls = (context.toolCalls || context.tools || []);\n"
+        "  let aIdx = -1, bIdx = -1;\n"
+        "  calls.forEach((c, i) => {\n"
+        "    if (aIdx === -1 && c.tool === a) aIdx = i;\n"
+        "    if (bIdx === -1 && c.tool === b) bIdx = i;\n"
+        "  });\n"
+        "  if (bIdx === -1) return { pass: true, score: 1, reason: 'B not invoked (n/a)' };\n"
+        "  if (aIdx === -1 || aIdx > bIdx) return { pass: false, score: 0, reason: `${a} did not precede ${b}` };\n"
+        "  return { pass: true, score: 1 };\n"
+        "}"
+    )
+
+
+def _js_conditional(keyword: str, tool: str) -> str:
+    return (
+        "(output, context) => {\n"
+        f"  const kw = {keyword!r}; const t = {tool!r};\n"
+        "  const userInput = (context.vars && context.vars.user_input) || '';\n"
+        "  if (!userInput.toLowerCase().includes(kw)) return { pass: true, score: 1, reason: 'precondition not met' };\n"
+        "  const calls = (context.toolCalls || context.tools || []);\n"
+        "  if (calls.some(c => c.tool === t)) return { pass: true, score: 1 };\n"
+        "  return { pass: false, score: 0, reason: `keyword '${kw}' present but tool '${t}' not invoked` };\n"
+        "}"
+    )
+
+
+def _js_success_rate(tool: str, rate: float) -> str:
+    return (
+        "(output, context) => {\n"
+        f"  const t = {tool!r}; const minRate = {rate};\n"
+        "  const calls = (context.toolCalls || context.tools || []).filter(c => c.tool === t);\n"
+        "  if (!calls.length) return { pass: true, score: 1, reason: 'tool not invoked (n/a)' };\n"
+        "  const ok = calls.filter(c => (c.result_status || 'success') === 'success').length;\n"
+        "  const observed = ok / calls.length;\n"
+        "  return { pass: observed >= minRate, score: observed,\n"
+        "           reason: `${t} success rate ${(observed*100).toFixed(1)}% vs target ${(minRate*100).toFixed(0)}%` };\n"
+        "}"
+    )
+
+
+def _js_tool_used(tool: str) -> str:
+    return (
+        "(output, context) => {\n"
+        f"  const t = {tool!r};\n"
+        "  const calls = (context.toolCalls || context.tools || []);\n"
+        "  return { pass: calls.some(c => c.tool === t), score: 1 };\n"
+        "}"
+    )
