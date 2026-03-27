@@ -70,3 +70,75 @@ async def mine_per_cluster(
 
     settings = get_settings()
     clustering = cluster_workflows(
+        traces,
+        k_min=k_min,
+        k_max=k_max,
+        min_traces_per_cluster=min_traces_per_cluster,
+    )
+    by_cluster = split_by_cluster(traces, clustering.labels)
+    log.info(
+        "clustered %d traces into k=%d (silhouette=%.3f, sizes=%s)",
+        len(traces), clustering.k, clustering.silhouette, clustering.cluster_sizes,
+    )
+
+    cluster_tasks: list[tuple[int, asyncio.Task]] = []
+
+    async def _mine_one(cluster_id: int, cluster_traces: list[NormalizedTrace]):
+        statistical_task = asyncio.create_task(
+            asyncio.to_thread(
+                run_statistical_track,
+                cluster_traces,
+                min_support_sequence=settings.mining_min_support,
+            )
+        )
+        llm_task = asyncio.create_task(run_llm_track(cluster_traces))
+        statistical, llm = await asyncio.gather(statistical_task, llm_task)
+        merged = cross_validate(statistical, llm)
+
+        invariants: list[MinedInvariant] = []
+        for cand in merged:
+            inv = formalize(
+                cand,
+                reject_threshold=settings.confidence_reject_threshold,
+                review_threshold=settings.confidence_review_threshold,
+            )
+            if inv is None or inv.status == InvariantStatus.REJECTED:
+                continue
+            # Stamp the cluster_id into params so the checker can route
+            inv.params = {**inv.params, "cluster_id": cluster_id}
+            invariants.append(inv)
+        return ClusterMiningResult(
+            cluster_id=cluster_id,
+            n_traces=len(cluster_traces),
+            invariants=invariants,
+            candidates_statistical=len(statistical),
+            candidates_llm=len(llm),
+        )
+
+    results = await asyncio.gather(
+        *(_mine_one(cid, ts) for cid, ts in by_cluster.items())
+    )
+
+    all_invariants: list[MinedInvariant] = []
+    for r in results:
+        all_invariants.extend(r.invariants)
+    all_invariants.sort(key=lambda i: -i.confidence)
+
+    return (
+        ClusteredMiningResult(
+            n_traces=len(traces),
+            n_clusters=clustering.k,
+            silhouette=clustering.silhouette,
+            cluster_sizes=clustering.cluster_sizes,
+            per_cluster=results,
+            invariants=all_invariants,
+        ),
+        clustering,
+    )
+
+
+def route_trace_to_cluster(
+    clustering: WorkflowClustering, trace: NormalizedTrace
+) -> int:
+    """Predict which cluster an incoming trace belongs to."""
+    return int(clustering.predict([trace])[0])
