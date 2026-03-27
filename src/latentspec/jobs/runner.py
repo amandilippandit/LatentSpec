@@ -90,3 +90,96 @@ class InProcessJobRunner(JobRunner):
             await session.flush()
             await session.refresh(job)
             job_id = job.id
+
+        ctx = JobContext(job_id=job_id, agent_id=agent_id)
+        task = asyncio.create_task(self._run(job_id, kind, config, ctx))
+        self._tasks[job_id] = (task, ctx)
+        return job_id
+
+    async def cancel(self, job_id: uuid.UUID) -> bool:
+        entry = self._tasks.get(job_id)
+        if entry is None:
+            return False
+        task, ctx = entry
+        ctx.cancel()
+        if not task.done():
+            task.cancel()
+        async with session_scope() as session:
+            row = await session.get(MiningJob, job_id)
+            if row is not None and row.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                row.status = JobStatus.CANCELLED
+                row.completed_at = datetime.now(UTC)
+        return True
+
+    async def _run(
+        self,
+        job_id: uuid.UUID,
+        kind: JobKind,
+        config: dict[str, Any],
+        ctx: JobContext,
+    ) -> None:
+        handler = self._handlers.get(kind)
+        if handler is None:
+            await self._fail(job_id, f"no handler registered for {kind.value}")
+            return
+
+        async with self._sem:
+            async with session_scope() as session:
+                row = await session.get(MiningJob, job_id)
+                if row is None or row.status == JobStatus.CANCELLED:
+                    return
+                row.status = JobStatus.RUNNING
+                row.started_at = datetime.now(UTC)
+
+            try:
+                result = await handler(ctx, config)
+            except asyncio.CancelledError:
+                async with session_scope() as session:
+                    row = await session.get(MiningJob, job_id)
+                    if row is not None:
+                        row.status = JobStatus.CANCELLED
+                        row.completed_at = datetime.now(UTC)
+                return
+            except Exception as e:  # noqa: BLE001
+                tb = traceback.format_exc()
+                log.exception("job %s failed", job_id)
+                await self._fail(job_id, f"{e!r}\n{tb[-2000:]}")
+                return
+
+            async with session_scope() as session:
+                row = await session.get(MiningJob, job_id)
+                if row is None:
+                    return
+                row.status = JobStatus.SUCCEEDED
+                row.completed_at = datetime.now(UTC)
+                row.progress_percent = 100.0
+                row.result = result
+
+    async def _fail(self, job_id: uuid.UUID, error: str) -> None:
+        async with session_scope() as session:
+            row = await session.get(MiningJob, job_id)
+            if row is None:
+                return
+            row.status = JobStatus.FAILED
+            row.completed_at = datetime.now(UTC)
+            row.error = error[:8000]
+
+
+_singleton: InProcessJobRunner | None = None
+
+
+def get_runner() -> InProcessJobRunner:
+    global _singleton
+    if _singleton is None:
+        _singleton = InProcessJobRunner()
+    return _singleton
+
+
+def register_handler(kind: JobKind, handler: JobHandler) -> None:
+    get_runner().register_handler(kind, handler)
+
+
+async def enqueue_job(
+    *, agent_id: uuid.UUID, kind: JobKind, config: dict[str, Any]
+) -> uuid.UUID:
+    return await get_runner().submit(agent_id=agent_id, kind=kind, config=config)
