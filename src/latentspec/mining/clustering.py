@@ -149,3 +149,155 @@ class TraceShapeVectorizer:
 
         # Behavioral feature scaler
         bf = np.asarray([_behavioral_features(t) for t in traces], dtype=np.float64)
+        if bf.size == 0:
+            bf = np.zeros((1, self.behavioral_dim))
+        self._behavioral_scaler = StandardScaler()
+        self._behavioral_scaler.fit(bf)
+        return self
+
+    def transform(self, traces: Sequence[NormalizedTrace]) -> np.ndarray:
+        if self._behavioral_scaler is None:
+            raise RuntimeError("call .fit() first")
+
+        n_tools = len(self._tool_idx)
+        n_kws = len(self._kw_idx)
+        dim = self.behavioral_dim + n_tools + n_kws
+        out = np.zeros((len(traces), dim), dtype=np.float64)
+
+        bf = np.asarray(
+            [_behavioral_features(t) for t in traces], dtype=np.float64
+        )
+        if bf.size > 0:
+            bf_scaled = self._behavioral_scaler.transform(bf)
+        else:
+            bf_scaled = np.zeros((0, self.behavioral_dim))
+
+        for i, trace in enumerate(traces):
+            out[i, : self.behavioral_dim] = bf_scaled[i]
+
+            # Tool TF-IDF
+            tool_counts = _tool_counts(trace)
+            tot = sum(tool_counts.values()) or 1
+            for tool, c in tool_counts.items():
+                idx = self._tool_idx.get(tool)
+                if idx is None:
+                    continue
+                out[i, self.behavioral_dim + idx] = (c / tot) * self._tool_idf[idx]
+
+            # Keyword TF-IDF
+            kw_counts = _keyword_counts(trace)
+            tot_kw = sum(kw_counts.values()) or 1
+            for kw, c in kw_counts.items():
+                idx = self._kw_idx.get(kw)
+                if idx is None:
+                    continue
+                out[i, self.behavioral_dim + n_tools + idx] = (
+                    (c / tot_kw) * self._kw_idf[idx]
+                )
+
+        # L2 normalize so cosine and Euclidean agree as cluster distances
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return out / norms
+
+    def fit_transform(self, traces: Sequence[NormalizedTrace]) -> np.ndarray:
+        return self.fit(traces).transform(traces)
+
+
+# ---- clustering ----------------------------------------------------------
+
+
+@dataclass
+class WorkflowClustering:
+    vectorizer: TraceShapeVectorizer
+    kmeans: KMeans
+    labels: np.ndarray
+    silhouette: float
+    k: int
+    cluster_sizes: dict[int, int]
+    centroids: np.ndarray
+
+    def predict(self, traces: Sequence[NormalizedTrace]) -> np.ndarray:
+        X = self.vectorizer.transform(traces)
+        return self.kmeans.predict(X)
+
+
+def _silhouette_safe(X: np.ndarray, labels: np.ndarray) -> float:
+    """Silhouette is undefined for k=1 or when any cluster has ≤ 1 point."""
+    unique = set(labels.tolist())
+    if len(unique) < 2:
+        return -1.0
+    sizes = Counter(labels.tolist())
+    if any(c < 2 for c in sizes.values()):
+        return -1.0
+    try:
+        return float(silhouette_score(X, labels, metric="cosine"))
+    except Exception:
+        return -1.0
+
+
+def cluster_workflows(
+    traces: Sequence[NormalizedTrace],
+    *,
+    k_min: int = 2,
+    k_max: int = 12,
+    min_traces_per_cluster: int = 8,
+    random_state: int = 17,
+    vectorizer: TraceShapeVectorizer | None = None,
+) -> WorkflowClustering:
+    """Cluster traces into workflow families. Returns the fitted artifact.
+
+    Picks k via silhouette score over `[k_min, k_max]`. Falls back to a
+    single-cluster result when fewer than `min_traces_per_cluster * k_min`
+    traces are available — too few to clustering cleanly.
+    """
+    if not traces:
+        raise ValueError("cluster_workflows: empty trace set")
+
+    vec = vectorizer or TraceShapeVectorizer()
+    X = vec.fit_transform(traces)
+    n = X.shape[0]
+
+    # Cap k_max by what the corpus can support
+    k_cap = max(k_min, min(k_max, n // max(1, min_traces_per_cluster)))
+    if k_cap < k_min or n < k_min * min_traces_per_cluster:
+        # One-cluster fallback
+        labels = np.zeros(n, dtype=int)
+        km = KMeans(n_clusters=1, random_state=random_state, n_init=4)
+        km.fit(X)
+        return WorkflowClustering(
+            vectorizer=vec,
+            kmeans=km,
+            labels=labels,
+            silhouette=0.0,
+            k=1,
+            cluster_sizes={0: n},
+            centroids=km.cluster_centers_,
+        )
+
+    best: WorkflowClustering | None = None
+    for k in range(k_min, k_cap + 1):
+        km = KMeans(n_clusters=k, random_state=random_state, n_init=4)
+        labels = km.fit_predict(X)
+        score = _silhouette_safe(X, labels)
+        if best is None or score > best.silhouette:
+            best = WorkflowClustering(
+                vectorizer=vec,
+                kmeans=km,
+                labels=labels,
+                silhouette=score,
+                k=k,
+                cluster_sizes=dict(Counter(labels.tolist())),
+                centroids=km.cluster_centers_,
+            )
+    assert best is not None
+    return best
+
+
+def split_by_cluster(
+    traces: Sequence[NormalizedTrace], labels: np.ndarray
+) -> dict[int, list[NormalizedTrace]]:
+    out: dict[int, list[NormalizedTrace]] = {}
+    for trace, label in zip(traces, labels.tolist(), strict=True):
+        out.setdefault(int(label), []).append(trace)
+    return out
