@@ -130,3 +130,136 @@ def _merge_cluster(cluster: list[InvariantCandidate]) -> InvariantCandidate:
     sources = {c.discovered_by for c in cluster}
     discovered_by = "both" if {"statistical", "llm"} <= sources else next(iter(sources))
 
+    merged_evidence: list[str] = []
+    seen: set[str] = set()
+    for c in cluster:
+        for tid in c.evidence_trace_ids:
+            if tid in seen:
+                continue
+            merged_evidence.append(tid)
+            seen.add(tid)
+            if len(merged_evidence) >= 100:
+                break
+
+    # Use the most-specific (most populated) params blob as the merged blob.
+    merged_extra: dict = {}
+    for c in cluster:
+        merged_extra.update(c.extra)
+
+    return base.model_copy(
+        update={
+            "support": max(c.support for c in cluster),
+            "consistency": max(c.consistency for c in cluster),
+            "evidence_trace_ids": merged_evidence,
+            "discovered_by": discovered_by,
+            "extra": merged_extra,
+        }
+    )
+
+
+def cross_validate(
+    statistical: list[InvariantCandidate],
+    llm: list[InvariantCandidate],
+    *,
+    similarity_threshold: float = 0.7,
+    backend: EmbeddingBackend | None = None,
+) -> list[InvariantCandidate]:
+    """Merge two candidate lists via TF-IDF cosine clustering.
+
+    Two candidates merge into one when:
+      1. They share the same `type`, AND
+      2. Their description vectors have cosine similarity >= threshold, AND
+      3. Their structured `params` are compatible (no conflicting keys).
+
+    Candidates that end up in a cluster spanning both tracks are marked
+    `discovered_by="both"` and earn the §3.4 cross_val_bonus.
+    """
+    all_candidates: list[InvariantCandidate] = list(statistical) + list(llm)
+    if not all_candidates:
+        return []
+
+    clusters = cluster_candidates_by_type_and_similarity(
+        all_candidates, threshold=similarity_threshold, backend=backend
+    )
+
+    merged: list[InvariantCandidate] = []
+    for cluster_indices in clusters:
+        members = [all_candidates[i] for i in cluster_indices]
+        # If any pair of members has incompatible params, fall back to
+        # the original normalize-string match (so we don't accidentally
+        # collapse two different rules with similar wording).
+        compatible = True
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                if not _params_overlap(members[i].extra, members[j].extra):
+                    compatible = False
+                    break
+            if not compatible:
+                break
+
+        if compatible:
+            merged.append(_merge_cluster(members))
+        else:
+            # Emit each separately; they're not the same rule.
+            merged.extend(members)
+
+    return merged
+
+
+# ----- Final confidence + triage -----------------------------------------
+
+
+@dataclass(frozen=True)
+class ScoreBreakdown:
+    support: float
+    consistency: float
+    cross_val: float
+    clarity: float
+    final: float
+
+
+def score_candidate(
+    candidate: InvariantCandidate,
+    *,
+    weights: ConfidenceWeights = DEFAULT_WEIGHTS,
+) -> ScoreBreakdown:
+    """Apply the §3.4 weighted-sum formula to a single candidate."""
+    support_score = max(0.0, min(1.0, candidate.support))
+    consistency_score = max(0.0, min(1.0, candidate.consistency))
+    cross_val_bonus = 1.0 if candidate.discovered_by == "both" else 0.0
+    clarity = _clarity_score(candidate.description)
+
+    final = (
+        weights.support * support_score
+        + weights.consistency * consistency_score
+        + weights.cross_val * cross_val_bonus
+        + weights.clarity * clarity
+    )
+    return ScoreBreakdown(
+        support=support_score,
+        consistency=consistency_score,
+        cross_val=cross_val_bonus,
+        clarity=clarity,
+        final=round(final, 4),
+    )
+
+
+def triage(
+    confidence: float,
+    *,
+    reject_threshold: float = 0.6,
+    review_threshold: float = 0.8,
+) -> InvariantStatus:
+    """§3.4 three-band gating policy.
+
+    Args:
+        confidence: final score on [0, 1].
+        reject_threshold: anything strictly below is auto-rejected.
+        review_threshold: anything at or above is auto-activated;
+            scores in [reject, review) become PENDING for human review.
+    """
+    if confidence < reject_threshold:
+        return InvariantStatus.REJECTED
+    if confidence < review_threshold:
+        return InvariantStatus.PENDING
+    return InvariantStatus.ACTIVE
