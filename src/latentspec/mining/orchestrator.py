@@ -120,3 +120,125 @@ async def mine_invariants(
         statistical, llm = await asyncio.gather(statistical_task, llm_task)
 
         merged = cross_validate(statistical, llm)
+
+        invariants: list[MinedInvariant] = []
+        dropped_invalid_params = 0
+        for cand in merged:
+            inv = formalize(
+                cand,
+                reject_threshold=settings.confidence_reject_threshold,
+                review_threshold=settings.confidence_review_threshold,
+            )
+            if inv is None:
+                # Failed params validation — drop rather than persist a
+                # rule the runtime checker can't evaluate.
+                dropped_invalid_params += 1
+                continue
+            if inv.status == InvariantStatus.REJECTED:
+                continue
+            invariants.append(inv)
+
+        invariants.sort(key=lambda i: -i.confidence)
+        if dropped_invalid_params:
+            log.info(
+                "dropped %d candidates with invalid params during mining run",
+                dropped_invalid_params,
+            )
+
+        if persist and session is not None:
+            await _persist_invariants(session, agent_id, invariants)
+
+        duration = asyncio.get_event_loop().time() - started_perf
+
+        if persist and session is not None and mining_run_id is not None:
+            run.completed_at = datetime.now(UTC)
+            run.invariants_discovered = len(invariants)
+            run.status = MiningRunStatus.COMPLETED
+            await session.flush()
+
+        return MiningResult(
+            agent_id=agent_id,
+            mining_run_id=mining_run_id,
+            traces_analyzed=len(traces),
+            candidates_statistical=len(statistical),
+            candidates_llm=len(llm),
+            candidates_total_unique=len(merged),
+            invariants=invariants,
+            duration_seconds=round(duration, 3),
+        )
+
+    except Exception as e:
+        log.exception("mining run failed")
+        if persist and session is not None and mining_run_id is not None:
+            run.status = MiningRunStatus.FAILED
+            run.error = repr(e)[:1000]
+            run.completed_at = datetime.now(UTC)
+            await session.flush()
+        raise
+
+
+async def _persist_invariants(
+    session: AsyncSession,
+    agent_id: uuid.UUID,
+    invariants: list[MinedInvariant],
+) -> None:
+    """Insert new invariants; update existing ones by matching (agent_id, type, description)."""
+    if not invariants:
+        return
+
+    existing = await session.execute(
+        select(Invariant).where(Invariant.agent_id == agent_id)
+    )
+    existing_by_key = {
+        (row.type, row.description): row for row in existing.scalars().all()
+    }
+
+    for inv in invariants:
+        key = (InvariantType(inv.type), inv.description)
+        evidence_uuids = _to_uuids(inv.evidence_trace_ids)
+
+        if key in existing_by_key:
+            row = existing_by_key[key]
+            row.confidence = inv.confidence
+            row.support_score = inv.support_score
+            row.consistency_score = inv.consistency_score
+            row.cross_val_bonus = inv.cross_val_bonus
+            row.clarity_score = inv.clarity_score
+            row.severity = Severity(inv.severity)
+            row.status = InvariantStatus(inv.status)
+            row.evidence_trace_ids = evidence_uuids
+            row.evidence_count = inv.evidence_count
+            row.discovered_by = inv.discovered_by
+            row.params = inv.params
+            continue
+
+        session.add(
+            Invariant(
+                agent_id=agent_id,
+                type=InvariantType(inv.type),
+                description=inv.description,
+                formal_rule=inv.formal_rule,
+                confidence=inv.confidence,
+                support_score=inv.support_score,
+                consistency_score=inv.consistency_score,
+                cross_val_bonus=inv.cross_val_bonus,
+                clarity_score=inv.clarity_score,
+                severity=Severity(inv.severity),
+                status=InvariantStatus(inv.status),
+                evidence_trace_ids=evidence_uuids,
+                evidence_count=inv.evidence_count,
+                violation_count=0,
+                discovered_by=inv.discovered_by,
+                params=inv.params,
+            )
+        )
+
+
+def _to_uuids(values: list[str]) -> list[uuid.UUID]:
+    out: list[uuid.UUID] = []
+    for v in values:
+        try:
+            out.append(uuid.UUID(str(v)))
+        except (ValueError, TypeError):
+            continue
+    return out
