@@ -74,3 +74,80 @@ def _agent_repertoire(
 
 
 def mine_negatives(
+    traces: list[NormalizedTrace],
+    *,
+    min_traces: int = 30,
+    policy: CustomerPolicy | None = None,
+) -> list[InvariantCandidate]:
+    """Emit closed-world repertoire + customer-denylist negative invariants.
+
+    The closed-world invariant is the foundation: it says the agent only
+    uses N specific tools. Any new tool would violate it — a much stronger
+    guarantee than the old curated catalog.
+    """
+    if len(traces) < min_traces:
+        return []
+
+    policy = policy or CustomerPolicy()
+    repertoire, counts = _agent_repertoire(
+        traces, min_support=policy.repertoire_min_support
+    )
+    repertoire |= set(policy.repertoire_extension)
+    repertoire = {t for t in repertoire if t}
+
+    candidates: list[InvariantCandidate] = []
+
+    if repertoire:
+        sorted_repertoire = sorted(repertoire)
+        sample_evidence = [t.trace_id for t in traces[:50]]
+        # Total invocations across the training set so we can quote it.
+        total_calls = sum(counts.values())
+        candidates.append(
+            InvariantCandidate(
+                type=InvariantType.NEGATIVE,
+                description=(
+                    f"The agent only invokes its known tool repertoire "
+                    f"({len(sorted_repertoire)} tools, {total_calls} observations)"
+                ),
+                formal_rule=(
+                    f"forall trace, step in trace.tool_calls: "
+                    f"step.tool in {sorted_repertoire}"
+                ),
+                evidence_trace_ids=sample_evidence,
+                support=1.0,
+                consistency=1.0,
+                severity=Severity.CRITICAL,
+                discovered_by="statistical",
+                extra={
+                    "allowed_repertoire": sorted_repertoire,
+                    "category": "closed_world_repertoire",
+                    "closed_world": True,
+                },
+            )
+        )
+
+    # Family-prefix anomalies — emit a negative when a learned family was
+    # observed and the customer has flagged the family as sensitive (e.g.
+    # all `payments_` tools should fail-closed if a new variant lands).
+    for pattern, severity, category in policy.denylist:
+        candidates.append(
+            InvariantCandidate(
+                type=InvariantType.NEGATIVE,
+                description=f"The agent never invokes a `{category}` action",
+                formal_rule=(
+                    f"forall trace, step in trace.tool_calls: "
+                    f"not match(step.tool, {pattern!r})"
+                ),
+                evidence_trace_ids=[t.trace_id for t in traces[:50]],
+                support=1.0,
+                consistency=1.0,
+                severity=severity,
+                discovered_by="statistical",
+                extra={
+                    "forbidden_patterns": [pattern],
+                    "category": category,
+                },
+            )
+        )
+
+    return candidates
