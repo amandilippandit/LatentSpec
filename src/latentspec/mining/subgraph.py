@@ -155,3 +155,160 @@ def _enumerate_paths(
         dfs(n.id, (), max_length)
     return paths
 
+
+def mine_frequent_paths(
+    traces: Sequence[DagTrace],
+    *,
+    min_support: float = 0.5,
+    max_length: int = 4,
+) -> list[InvariantCandidate]:
+    """Discover frequent rooted DAG paths."""
+    if not traces:
+        return []
+    n = len(traces)
+    min_count = max(1, int(min_support * n))
+
+    path_counts: Counter[tuple[str, ...]] = Counter()
+    evidence: dict[tuple[str, ...], list[str]] = defaultdict(list)
+    for trace in traces:
+        # A path can occur multiple times in one trace; use set to count
+        # per-trace presence, matching PrefixSpan's per-sequence support.
+        unique: set[tuple[str, ...]] = set(_enumerate_paths(trace, max_length=max_length))
+        for p in unique:
+            path_counts[p] += 1
+            evidence[p].append(trace.trace_id)
+
+    out: list[InvariantCandidate] = []
+    for path, count in path_counts.items():
+        if count < min_count or len(path) < 2:
+            continue
+        support = count / n
+        if len(path) == 2:
+            description = f"The agent always reaches `{path[1]}` from `{path[0]}` in the DAG"
+        else:
+            description = "The agent always traces the path " + " → ".join(
+                f"`{t}`" for t in path
+            )
+        out.append(
+            InvariantCandidate(
+                type=InvariantType.ORDERING,
+                description=description,
+                formal_rule=(
+                    f"forall trace: path_exists(trace.dag, {list(path)})"
+                ),
+                evidence_trace_ids=evidence[path][:50],
+                support=round(support, 4),
+                consistency=round(support, 4),
+                severity=Severity.MEDIUM,
+                discovered_by="statistical",
+                extra={
+                    "tool_a": path[0],
+                    "tool_b": path[-1],
+                    "chain": list(path),
+                    "pattern_length": len(path),
+                    "subgraph_mined": True,
+                },
+            )
+        )
+    return out
+
+
+# ---- frequent fork patterns ---------------------------------------------
+
+
+def mine_frequent_forks(
+    traces: Sequence[DagTrace],
+    *,
+    min_support: float = 0.5,
+    min_fork_arity: int = 2,
+) -> list[InvariantCandidate]:
+    """Each parent_tool with out-degree >= 2 contributes a (parent_tool,
+    sorted children) signature. Frequent signatures emit as composition
+    invariants — "tool A always spawns these N children concurrently"."""
+    if not traces:
+        return []
+    n = len(traces)
+    min_count = max(1, int(min_support * n))
+
+    fork_counts: Counter[tuple[str, tuple[str, ...]]] = Counter()
+    evidence: dict[tuple[str, tuple[str, ...]], list[str]] = defaultdict(list)
+
+    for trace in traces:
+        by_id, fwd = _build_index(trace)
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for src_id, targets in fwd.items():
+            if len(targets) < min_fork_arity:
+                continue
+            src_tool = _tool_of(by_id.get(src_id)) if src_id in by_id else None
+            if not src_tool:
+                continue
+            child_tools = tuple(
+                sorted(
+                    t for t in (_tool_of(by_id.get(tid)) for tid in targets) if t
+                )
+            )
+            if len(child_tools) < min_fork_arity:
+                continue
+            key = (src_tool, child_tools)
+            if key in seen:
+                continue
+            seen.add(key)
+            fork_counts[key] += 1
+            evidence[key].append(trace.trace_id)
+
+    out: list[InvariantCandidate] = []
+    for (parent, children), count in fork_counts.items():
+        if count < min_count:
+            continue
+        support = count / n
+        children_str = ", ".join(f"`{c}`" for c in children)
+        out.append(
+            InvariantCandidate(
+                type=InvariantType.COMPOSITION,
+                description=f"`{parent}` always spawns concurrent calls to {children_str}",
+                formal_rule=(
+                    f"forall trace, src in trace.dag where src.tool == '{parent}': "
+                    f"set(out_neighbors(src).tool) == {list(children)}"
+                ),
+                evidence_trace_ids=evidence[(parent, children)][:50],
+                support=round(support, 4),
+                consistency=round(support, 4),
+                severity=Severity.MEDIUM,
+                discovered_by="statistical",
+                extra={
+                    "upstream_tool": parent,
+                    "downstream_tool": children[0],
+                    "fork_children": list(children),
+                    "subgraph_mined": True,
+                },
+            )
+        )
+    return out
+
+
+# ---- driver --------------------------------------------------------------
+
+
+@dataclass
+class SubgraphMiningResult:
+    edges: list[InvariantCandidate] = field(default_factory=list)
+    paths: list[InvariantCandidate] = field(default_factory=list)
+    forks: list[InvariantCandidate] = field(default_factory=list)
+
+    def all(self) -> list[InvariantCandidate]:
+        return [*self.edges, *self.paths, *self.forks]
+
+
+def run_subgraph_mining(
+    traces: Sequence[DagTrace],
+    *,
+    min_support: float = 0.5,
+    max_path_length: int = 4,
+) -> SubgraphMiningResult:
+    return SubgraphMiningResult(
+        edges=mine_frequent_edges(traces, min_support=min_support),
+        paths=mine_frequent_paths(
+            traces, min_support=min_support, max_length=max_path_length
+        ),
+        forks=mine_frequent_forks(traces, min_support=min_support),
+    )
