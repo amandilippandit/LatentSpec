@@ -80,3 +80,85 @@ async def _generate_one(
     }
     try:
         resp = await client.messages.create(
+            model=settings.anthropic_model,
+            max_tokens=320,
+            temperature=0.2,
+            system=ROOT_CAUSE_SYSTEM,
+            messages=[
+                {
+                    "role": "user",
+                    "content": json.dumps(payload, ensure_ascii=False),
+                }
+            ],
+        )
+        text = "".join(getattr(b, "text", "") or "" for b in resp.content).strip()
+        if not text:
+            text = _fallback_hypothesis(summary)
+    except Exception as e:
+        log.warning("root-cause LLM call failed: %s", e)
+        text = _fallback_hypothesis(summary)
+
+    return RootCauseHint(
+        invariant_id=summary.invariant_id,
+        description=summary.description,
+        hypothesis=text,
+        affected_segments=affected_segments,
+    )
+
+
+async def generate_root_cause_hints(
+    failures: list[InvariantBatchSummary],
+    baseline_traces: list[NormalizedTrace],
+    candidate_traces: list[NormalizedTrace],
+    *,
+    concurrency: int = 4,
+) -> list[RootCauseHint]:
+    """Generate one hint per failed invariant."""
+    if not failures:
+        return []
+
+    bl_by_id = {t.trace_id: t for t in baseline_traces}
+    cd_by_id = {t.trace_id: t for t in candidate_traces}
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _bounded(summary: InvariantBatchSummary) -> RootCauseHint:
+        async with sem:
+            failing = (
+                cd_by_id.get(summary.sample_failure_traces[0])
+                if summary.sample_failure_traces
+                else None
+            )
+            baseline = next(iter(bl_by_id.values())) if bl_by_id else None
+            return await _generate_one(summary, baseline, failing)
+
+    return await asyncio.gather(*(_bounded(f) for f in failures))
+
+
+def _summarize_trace(trace: NormalizedTrace | None) -> dict | None:
+    if trace is None:
+        return None
+    return {
+        "trace_id": trace.trace_id,
+        "metadata": trace.metadata.model_dump(exclude_none=True),
+        "steps": [
+            {
+                k: v
+                for k, v in s.model_dump().items()
+                if k in {"type", "tool", "args", "latency_ms", "result_status", "content"}
+                and v is not None
+            }
+            for s in trace.steps
+        ],
+    }
+
+
+def _collect_segments(traces: list[NormalizedTrace | None]) -> list[str]:
+    out: list[str] = []
+    for t in traces:
+        if t is None:
+            continue
+        seg = t.metadata.user_segment
+        if seg and seg not in out:
+            out.append(seg)
+    return out
