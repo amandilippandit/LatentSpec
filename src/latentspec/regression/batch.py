@@ -104,3 +104,109 @@ _REGRESSION_DROP = 0.10
 
 def compare_trace_sets(
     invariants: Iterable[InvariantSpec],
+    baseline: Iterable[NormalizedTrace],
+    candidate: Iterable[NormalizedTrace],
+    *,
+    regression_drop: float = _REGRESSION_DROP,
+    min_applicable: int = _MIN_APPLICABLE,
+) -> RegressionReport:
+    """Score baseline & candidate on the same invariant set; flag regressions.
+
+    A FAILURE is reported when:
+      - the candidate fail_rate strictly exceeds the baseline fail_rate, AND
+      - the candidate has at least `min_applicable` applicable traces, AND
+      - the candidate pass_rate dropped by at least `regression_drop`.
+
+    A WARNING (e.g. perf regression) is reported when warn_rate goes up
+    by at least `regression_drop`, even without a fail-rate change.
+    """
+    invariants = list(invariants)
+    baseline_traces = list(baseline)
+    candidate_traces = list(candidate)
+
+    baseline_results = check_traces(invariants, baseline_traces)
+    candidate_results = check_traces(invariants, candidate_traces)
+
+    bl_by_inv: dict[str, list[CheckResult]] = defaultdict(list)
+    cd_by_inv: dict[str, list[CheckResult]] = defaultdict(list)
+    for r in baseline_results:
+        bl_by_inv[r.invariant_id].append(r)
+    for r in candidate_results:
+        cd_by_inv[r.invariant_id].append(r)
+
+    baseline_summaries: list[InvariantBatchSummary] = []
+    candidate_summaries: list[InvariantBatchSummary] = []
+    failures: list[InvariantBatchSummary] = []
+    warnings: list[InvariantBatchSummary] = []
+    passes = 0
+
+    for inv in invariants:
+        bl = _summarize(inv, bl_by_inv.get(inv.id, []))
+        cd = _summarize(inv, cd_by_inv.get(inv.id, []))
+        baseline_summaries.append(bl)
+        candidate_summaries.append(cd)
+
+        if cd.applicable < min_applicable:
+            passes += 1
+            continue
+
+        # FAIL: candidate fail_rate is materially higher than baseline.
+        if (
+            cd.fail_rate > bl.fail_rate
+            and cd.pass_rate <= bl.pass_rate - regression_drop
+        ):
+            failures.append(cd)
+            continue
+
+        # WARN: perf-style regression (warn_rate up).
+        if cd.warn_rate >= bl.warn_rate + regression_drop:
+            warnings.append(cd)
+            continue
+
+        passes += 1
+
+    counts = Counter(
+        {
+            "PASS": passes,
+            "WARN": len(warnings),
+            "FAIL": len(failures),
+            "CHECKED": len(invariants),
+        }
+    )
+
+    return RegressionReport(
+        invariants_checked=len(invariants),
+        baseline=baseline_summaries,
+        candidate=candidate_summaries,
+        failures=failures,
+        warnings=warnings,
+        passes=passes,
+        counts=dict(counts),
+    )
+
+
+def _exit_code_for(report: RegressionReport, fail_on: str) -> int:
+    """Compute the §4.2 exit code from a regression report.
+
+    fail_on:
+      - "critical": exit non-zero only on critical-severity failures
+      - "high":     non-zero on critical or high failures
+      - "any":      non-zero on any failure
+      - "warn":     non-zero on any warning or failure
+      - "never":    always exit 0 (advisory mode)
+    """
+    fail_on = fail_on.lower()
+    if fail_on == "never":
+        return 0
+    if fail_on == "warn":
+        if report.failures or report.warnings:
+            return 1
+        return 0
+    if fail_on == "any":
+        return 1 if report.failures else 0
+    if fail_on == "high":
+        critical = [f for f in report.failures if f.severity in (Severity.CRITICAL, Severity.HIGH)]
+        return 1 if critical else 0
+    # default: critical-only
+    critical = [f for f in report.failures if f.severity == Severity.CRITICAL]
+    return 1 if critical else 0
