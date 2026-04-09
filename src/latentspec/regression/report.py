@@ -69,3 +69,75 @@ def _format_warning(
         comparison = f"warning rate {bl_warn}% -> {cd_warn}%"
     else:
         comparison = f"warned on {round(summary.warn_rate * 100)}% of test traces"
+    head = f"  [{summary.severity.value.upper():<8}] inv-{_short_id(summary.invariant_id)}: {summary.description}"
+    body = f"             ({comparison})"
+    return f"{head}\n{body}"
+
+
+def _severity_tag(s: Severity) -> str:
+    return s.value.upper()
+
+
+def format_pr_comment(
+    report: RegressionReport,
+    *,
+    agent_name: str = "agent",
+    extra: Mapping[str, str] | None = None,
+) -> str:
+    """Render the §4.2 PR-comment body."""
+    lines: list[str] = []
+    lines.append("LatentSpec Behavioral Regression Report")
+    lines.append("=" * 40)
+    lines.append(
+        f"Agent: {agent_name} | Invariants checked: {report.invariants_checked}"
+    )
+    lines.append(
+        f"PASS ({report.passes}) | WARN ({len(report.warnings)}) | FAIL ({len(report.failures)})"
+    )
+
+    if extra:
+        for k, v in extra.items():
+            lines.append(f"{k}: {v}")
+
+    bl = _baseline_lookup(report)
+
+    if report.failures:
+        lines.append("")
+        lines.append("FAILURES:")
+        for f in sorted(
+            report.failures, key=lambda x: _severity_rank(x.severity), reverse=True
+        ):
+            lines.append(_format_failure(f, bl.get(f.invariant_id), severity_tag=_severity_tag(f.severity)))
+
+    if report.warnings:
+        lines.append("")
+        lines.append("WARNINGS:")
+        for w in sorted(
+            report.warnings, key=lambda x: _severity_rank(x.severity), reverse=True
+        ):
+            lines.append(_format_warning(w, bl.get(w.invariant_id)))
+
+    if not report.failures and not report.warnings:
+        lines.append("")
+        lines.append("No regressions detected ✓")
+
+    return "\n".join(lines)
+
+
+def format_terminal(
+    report: RegressionReport, *, agent_name: str = "agent"
+) -> str:
+    """Slightly more verbose rendering for `latentspec check` terminal output."""
+    lines = [format_pr_comment(report, agent_name=agent_name)]
+    if report.failures or report.warnings:
+        lines.append("")
+        lines.append("Sample offending trace IDs:")
+        for f in report.failures + report.warnings:
+            sample = (f.sample_failure_traces or f.sample_warn_traces)[:3]
+            if sample:
+                lines.append(f"  inv-{_short_id(f.invariant_id)}: {', '.join(sample)}")
+    return "\n".join(lines)
+
+
+def _severity_rank(s: Severity) -> int:
+    return {Severity.CRITICAL: 4, Severity.HIGH: 3, Severity.MEDIUM: 2, Severity.LOW: 1}[s]
