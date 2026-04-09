@@ -125,3 +125,130 @@ def get_pack(pack_id: str) -> VerticalPack | None:
 
 
 def list_packs() -> list[str]:
+    try:
+        files = resources.files(_PACK_PACKAGE)
+        return sorted(
+            p.name.removesuffix(".json")
+            for p in files.iterdir()
+            if p.name.endswith(".json")
+        )
+    except (ModuleNotFoundError, AttributeError):
+        return []
+
+
+# ---- install + score -----------------------------------------------------
+
+
+def install_pack(
+    *, agent_id: uuid.UUID, pack_id: str
+) -> list[MinedInvariant]:
+    """Materialize a pack into a list of `MinedInvariant` rows.
+
+    Each materialized invariant carries `discovered_by="pack"`, a stable
+    `cluster_id`-style `pack_id` in params, and starts in `status=pending`
+    until `auto_fit_score` validates it against real traffic.
+    """
+    pack = get_pack(pack_id)
+    if pack is None:
+        raise ValueError(f"unknown pack: {pack_id}")
+
+    materialized: list[MinedInvariant] = []
+    now = datetime.now(UTC)
+    for entry in pack.invariants:
+        try:
+            # Validate FIRST against the strict per-type schema so we can't
+            # ship a pack rule the runtime checker can't read. Provenance
+            # (pack_id, pack_version) is added afterwards.
+            params = validate_params(entry.type, dict(entry.params))
+        except ParamsValidationError:
+            continue
+        params = {
+            **params,
+            "pack_id": pack.pack_id,
+            "pack_version": pack.version,
+        }
+        materialized.append(
+            MinedInvariant(
+                invariant_id=f"pack-{uuid.uuid4().hex[:8]}",
+                type=entry.type,
+                description=entry.description,
+                formal_rule=entry.formal_rule
+                or f"pack({pack.pack_id}).{entry.type.value}",
+                confidence=0.65,  # mid-band — pending until auto-fit promotes
+                support_score=0.7,
+                consistency_score=0.7,
+                cross_val_bonus=0.0,
+                clarity_score=0.85,
+                evidence_count=0,
+                violation_count=0,
+                discovered_at=now,
+                status=InvariantStatus.PENDING,
+                severity=entry.severity,
+                discovered_by="pack",  # type: ignore[arg-type]
+                evidence_trace_ids=[],
+                params=params,
+            )
+        )
+    return materialized
+
+
+@dataclass
+class AutoFitScore:
+    fit: float  # weighted final score in [0, 1]
+    applicability: float  # fraction of traces where the rule applied
+    pass_rate: float  # fraction of applicable traces where it held
+    sample_size: int
+
+
+_SEVERITY_WEIGHT = {
+    Severity.CRITICAL: 0.4,  # critical rules stay even at marginal fit
+    Severity.HIGH: 0.5,
+    Severity.MEDIUM: 0.6,
+    Severity.LOW: 0.7,
+}
+
+
+def auto_fit_score(
+    *,
+    invariant: MinedInvariant,
+    traces: list[NormalizedTrace],
+) -> AutoFitScore:
+    """Score how well a pack invariant fits the agent's real traces.
+
+    Applicability + pass rate combine via a severity-weighted threshold:
+    higher severity makes the rule sticker (we'd rather keep a critical
+    rule pending review than auto-reject it).
+    """
+    spec = InvariantSpec(
+        id=invariant.invariant_id,
+        type=invariant.type,
+        description=invariant.description,
+        formal_rule=invariant.formal_rule,
+        severity=invariant.severity,
+        params={k: v for k, v in invariant.params.items() if k not in {"pack_id", "pack_version"}},
+    )
+
+    n_applicable = 0
+    n_passing = 0
+    for trace in traces:
+        outcome = dispatch(spec, trace).outcome
+        if outcome == CheckOutcome.NOT_APPLICABLE:
+            continue
+        n_applicable += 1
+        if outcome == CheckOutcome.PASS:
+            n_passing += 1
+
+    if not traces:
+        return AutoFitScore(fit=0.0, applicability=0.0, pass_rate=0.0, sample_size=0)
+
+    applicability = n_applicable / len(traces)
+    pass_rate = n_passing / max(1, n_applicable)
+    weight = _SEVERITY_WEIGHT[invariant.severity]
+    fit = weight * applicability + (1 - weight) * pass_rate
+
+    return AutoFitScore(
+        fit=round(fit, 4),
+        applicability=round(applicability, 4),
+        pass_rate=round(pass_rate, 4),
+        sample_size=len(traces),
+    )
