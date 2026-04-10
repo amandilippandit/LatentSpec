@@ -79,3 +79,84 @@ class DagTrace(BaseModel):
 
     @classmethod
     def from_linear(cls, trace: NormalizedTrace) -> "DagTrace":
+        """Lift a linear NormalizedTrace into a chain-shaped DAG."""
+        nodes = [
+            TraceNode(id=f"n{i}", step=step) for i, step in enumerate(trace.steps)
+        ]
+        edges = [
+            TraceEdge(source=f"n{i}", target=f"n{i+1}", kind=EdgeKind.SEQUENTIAL)
+            for i in range(len(trace.steps) - 1)
+        ]
+        return cls(
+            trace_id=trace.trace_id,
+            agent_id=trace.agent_id,
+            timestamp=trace.timestamp,
+            nodes=nodes,
+            edges=edges,
+            metadata=trace.metadata,
+        )
+
+    def to_linear(self) -> NormalizedTrace:
+        """Topologically sort and project to a linear NormalizedTrace.
+
+        Concurrent / merged nodes interleave by start time. Loops collapse
+        to a single visit per node. The result is suitable for passing to
+        any of the existing rule-based checkers, the Z3 verifier, etc.
+        """
+        ordered = self._topological_sort()
+        steps = [node.step for node in ordered]
+        return NormalizedTrace(
+            trace_id=self.trace_id,
+            agent_id=self.agent_id,
+            timestamp=self.timestamp,
+            steps=steps,
+            metadata=self.metadata,
+        )
+
+    def _topological_sort(self) -> list[TraceNode]:
+        """Kahn's algorithm with start-time tiebreaker."""
+        node_by_id = {n.id: n for n in self.nodes}
+        # Forward + reverse adjacency, ignoring back-edges to keep DAG-ness
+        forward: dict[str, list[str]] = {n.id: [] for n in self.nodes}
+        in_deg: dict[str, int] = {n.id: 0 for n in self.nodes}
+        for e in self.edges:
+            if e.kind == EdgeKind.LOOP:
+                continue
+            if e.source not in forward or e.target not in in_deg:
+                continue
+            forward[e.source].append(e.target)
+            in_deg[e.target] += 1
+
+        # Initial frontier: nodes with no inbound, sorted by start time
+        ready = [
+            n for n in self.nodes if in_deg.get(n.id, 0) == 0
+        ]
+        ready.sort(key=lambda n: n.started_at or self.timestamp)
+
+        out: list[TraceNode] = []
+        while ready:
+            node = ready.pop(0)
+            out.append(node)
+            for nxt_id in forward.get(node.id, []):
+                in_deg[nxt_id] -= 1
+                if in_deg[nxt_id] == 0:
+                    ready.append(node_by_id[nxt_id])
+                    ready.sort(key=lambda n: n.started_at or self.timestamp)
+
+        # Append any remaining (cycle-only) nodes in insertion order
+        seen = {n.id for n in out}
+        for n in self.nodes:
+            if n.id not in seen:
+                out.append(n)
+        return out
+
+    @property
+    def has_branching(self) -> bool:
+        out_degree: dict[str, int] = {}
+        for e in self.edges:
+            out_degree[e.source] = out_degree.get(e.source, 0) + 1
+        return any(d > 1 for d in out_degree.values())
+
+    @property
+    def has_loops(self) -> bool:
+        return any(e.kind == EdgeKind.LOOP for e in self.edges)
