@@ -129,3 +129,134 @@ class LatentSpecClient:
 
     def _run(self) -> None:
         batch: list[NormalizedTrace] = []
+        while not self._stop.is_set():
+            try:
+                item = self._queue.get(timeout=self._config.flush_interval_seconds)
+            except queue.Empty:
+                if batch:
+                    self._send(batch)
+                    batch = []
+                continue
+            if item is None:
+                self._queue.task_done()
+                break
+            batch.append(item)
+            self._queue.task_done()
+            if len(batch) >= self._config.flush_threshold:
+                self._send(batch)
+                batch = []
+        if batch:
+            self._send(batch)
+
+    def _send(self, traces: list[NormalizedTrace]) -> None:
+        if self._client is None or not traces:
+            return
+        try:
+            payload = {
+                "traces": [
+                    {
+                        "agent_id": str(self._coerce_agent_id(self._config.agent_id)),
+                        "format": "normalized",
+                        "payload": t.model_dump(mode="json"),
+                        "version_tag": t.metadata.version,
+                    }
+                    for t in traces
+                ]
+            }
+            resp = self._client.post("/traces/batch", json=payload)
+            if resp.status_code >= 400:
+                log.warning(
+                    "latentspec /traces/batch returned %s: %s",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+        except Exception as e:
+            log.warning("latentspec trace shipment failed: %s", e)
+
+    @staticmethod
+    def _coerce_agent_id(agent_id: str) -> UUID | str:
+        try:
+            return UUID(agent_id)
+        except (ValueError, TypeError):
+            return agent_id
+
+
+# ---------------- module-level singleton API (the public surface) ---------
+
+_client: LatentSpecClient | None = None
+_lock = threading.Lock()
+
+
+def init(
+    *,
+    api_key: str | None = None,
+    agent_id: str | None = None,
+    api_base: str | None = None,
+    enabled: bool = True,
+    timeout: float = 5.0,
+) -> LatentSpecClient:
+    """Bootstrap the SDK. Idempotent — calling twice replaces the client."""
+    global _client
+    config = SDKConfig(
+        api_key=api_key or os.environ.get("LATENTSPEC_API_KEY", ""),
+        agent_id=agent_id or os.environ.get("LATENTSPEC_AGENT_ID", ""),
+        api_base=api_base or os.environ.get(
+            "LATENTSPEC_API_BASE", "https://api.latentspec.dev"
+        ),
+        enabled=enabled,
+        timeout=timeout,
+    )
+    with _lock:
+        if _client is not None:
+            _client.shutdown(timeout=1.0)
+        _client = LatentSpecClient(config)
+        atexit.register(_client.shutdown)
+    return _client
+
+
+def get_client() -> LatentSpecClient | None:
+    return _client
+
+
+def is_initialized() -> bool:
+    return _client is not None and _client.enabled
+
+
+def record_trace(trace: NormalizedTrace) -> None:
+    """Ship a fully-formed §3.2 trace."""
+    if _client is None:
+        return
+    _client.record(trace)
+
+
+def flush(timeout: float = 5.0) -> None:
+    if _client is not None:
+        _client.flush(timeout=timeout)
+
+
+def shutdown(timeout: float = 5.0) -> None:
+    global _client
+    with _lock:
+        if _client is None:
+            return
+        _client.shutdown(timeout=timeout)
+        _client = None
+
+
+def configure_for_test(client: LatentSpecClient | None) -> None:
+    """Test helper — inject a custom (or fake) client."""
+    global _client
+    with _lock:
+        _client = client
+
+
+def _redact_trace(trace: NormalizedTrace, redactor: Any) -> NormalizedTrace:
+    """Return a copy of `trace` with redaction applied to every string field."""
+    new_steps = []
+    for step in trace.steps:
+        data = step.model_dump()
+        for key in ("content", "args", "result"):
+            if key in data:
+                data[key] = redactor.redact_value(key, data[key])
+        new_steps.append(type(step).model_validate(data))
+    return trace.model_copy(update={"steps": new_steps})
