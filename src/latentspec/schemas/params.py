@@ -128,3 +128,133 @@ class StatisticalParams(_Base):
     tool: str | None = None
     feature: str | None = None
     threshold: float | None = None
+    rate: float | None = Field(default=None, ge=0.0, le=1.0)
+    percentile: float | None = Field(default=None, ge=0.0, le=100.0)
+    p1: float | None = None
+    p99: float | None = None
+    median: float | None = None
+    samples: int | None = Field(default=None, ge=0)
+    within_rate: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @field_validator("tool")
+    @classmethod
+    def _validate_tool(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _check_tool(v, field="tool")
+
+    @model_validator(mode="after")
+    def _required_for_metric(self) -> "StatisticalParams":
+        if self.metric == "latency_ms":
+            if not self.tool:
+                raise ValueError("latency_ms requires `tool`")
+            if self.threshold is None or self.threshold < 0:
+                raise ValueError("latency_ms requires non-negative `threshold`")
+        elif self.metric == "success_rate":
+            if not self.tool:
+                raise ValueError("success_rate requires `tool`")
+            if self.rate is None:
+                raise ValueError("success_rate requires `rate`")
+        elif self.metric == "feature_envelope":
+            if not self.feature:
+                raise ValueError("feature_envelope requires `feature`")
+            if self.p1 is None or self.p99 is None or self.p99 < self.p1:
+                raise ValueError("feature_envelope requires `p1 <= p99`")
+        return self
+
+
+class StateParams(_Base):
+    """After `terminator_tool`, the agent must not invoke any of `forbidden_after`."""
+
+    terminator_tool: str
+    forbidden_after: list[str] = Field(min_length=1)
+
+    @field_validator("terminator_tool")
+    @classmethod
+    def _validate_terminator(cls, v: str) -> str:
+        return _check_tool(v, field="terminator_tool")
+
+    @field_validator("forbidden_after")
+    @classmethod
+    def _validate_after(cls, v: list[str]) -> list[str]:
+        for t in v:
+            _check_tool(t, field="forbidden_after")
+        return v
+
+
+class CompositionParams(_Base):
+    """Upstream tool must precede every downstream invocation."""
+
+    upstream_tool: str
+    downstream_tool: str
+
+    @field_validator("upstream_tool", "downstream_tool")
+    @classmethod
+    def _validate_tool(cls, v: str) -> str:
+        return _check_tool(v, field="composition")
+
+
+class ToolSelectionParams(_Base):
+    """Segment-keyed routing: in `segment` use `expected_tool`, not `forbidden_tool`."""
+
+    segment: str
+    expected_tool: str
+    forbidden_tool: str | None = None
+
+    @field_validator("segment")
+    @classmethod
+    def _validate_segment(cls, v: str) -> str:
+        if not _SEGMENT_RE.match(v):
+            raise ValueError(f"invalid segment {v!r}")
+        return v
+
+    @field_validator("expected_tool", "forbidden_tool")
+    @classmethod
+    def _validate_tool(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _check_tool(v, field="tool_selection")
+
+
+class OutputFormatParams(_Base):
+    """LLM-as-judge — opaque to the system, only the description matters."""
+
+    rubric: str | None = Field(default=None, max_length=2048)
+
+
+_SCHEMA_BY_TYPE: dict[InvariantType, type[BaseModel]] = {
+    InvariantType.ORDERING: OrderingParams,
+    InvariantType.CONDITIONAL: ConditionalParams,
+    InvariantType.NEGATIVE: NegativeParams,
+    InvariantType.STATISTICAL: StatisticalParams,
+    InvariantType.STATE: StateParams,
+    InvariantType.COMPOSITION: CompositionParams,
+    InvariantType.TOOL_SELECTION: ToolSelectionParams,
+    InvariantType.OUTPUT_FORMAT: OutputFormatParams,
+}
+
+
+def schema_for(invariant_type: InvariantType) -> type[BaseModel]:
+    return _SCHEMA_BY_TYPE[invariant_type]
+
+
+def validate_params(
+    invariant_type: InvariantType, params: dict[str, Any]
+) -> dict[str, Any]:
+    """Validate and normalize params; raises ParamsValidationError on failure.
+
+    Always run this before:
+      - persisting an invariant to the DB
+      - dispatching a checker against an invariant
+      - merging two candidates in cross-validation
+    """
+    schema = _SCHEMA_BY_TYPE.get(invariant_type)
+    if schema is None:
+        return dict(params)
+    try:
+        validated = schema.model_validate(params)
+    except Exception as e:  # ValidationError, ValueError, TypeError
+        raise ParamsValidationError(
+            f"params for {invariant_type.value} failed schema: {e}"
+        ) from e
+    return validated.model_dump(exclude_none=True)
