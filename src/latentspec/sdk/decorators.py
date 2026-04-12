@@ -129,3 +129,135 @@ def trace_tool(
                 except BaseException as e:  # noqa: BLE001
                     status = "error"
                     exc = e
+                    raise
+                finally:
+                    latency_ms = max(0, int((time.perf_counter() - start) * 1000))
+                    _record_step(
+                        ToolCallStep(
+                            tool=tool_name,
+                            args=_args_to_dict(target, args, kwargs),
+                            latency_ms=latency_ms,
+                            result_status=status,
+                            result=_safe_serialize(result),
+                        )
+                    )
+                    if exc is not None:
+                        log.debug("%s raised %r", tool_name, exc)
+
+            return _async_wrapper
+
+        @functools.wraps(target)
+        def _sync_wrapper(*args: Any, **kwargs: Any) -> Any:
+            start = time.perf_counter()
+            status = "success"
+            exc: BaseException | None = None
+            result: Any = None
+            try:
+                result = target(*args, **kwargs)
+                return result
+            except BaseException as e:  # noqa: BLE001
+                status = "error"
+                exc = e
+                raise
+            finally:
+                latency_ms = max(0, int((time.perf_counter() - start) * 1000))
+                _record_step(
+                    ToolCallStep(
+                        tool=tool_name,
+                        args=_args_to_dict(target, args, kwargs),
+                        latency_ms=latency_ms,
+                        result_status=status,
+                        result=_safe_serialize(result),
+                    )
+                )
+                if exc is not None:
+                    log.debug("%s raised %r", tool_name, exc)
+
+        return _sync_wrapper
+
+    if func is None:
+        return _decorator
+    return _decorator(func)
+
+
+class trace(AbstractContextManager["trace"]):  # noqa: N801 — public API casing
+    """Group multiple `@trace_tool` calls into one logical §3.2 trace.
+
+    Usage:
+        with latentspec.trace(user_input="book a flight"):
+            search_flights(...)
+            book_flight(...)
+        # on __exit__, the assembled NormalizedTrace ships to the API.
+    """
+
+    def __init__(
+        self,
+        *,
+        user_input: str | None = None,
+        agent_id: str | None = None,
+        version: str | None = None,
+        user_segment: str | None = None,
+    ) -> None:
+        from latentspec.sdk.client import get_client
+
+        client = get_client()
+        resolved_agent_id = agent_id or (client.config.agent_id if client else "")
+        self._collector = StepCollector(
+            agent_id=resolved_agent_id,
+            metadata=TraceMetadata(version=version, user_segment=user_segment),
+        )
+        if user_input is not None:
+            self._collector.add(UserInputStep(content=user_input))
+        self._token: contextvars.Token[StepCollector | None] | None = None
+        self._final_response: str | None = None
+
+    def __enter__(self) -> trace:
+        self._token = _current.set(self._collector)
+        return self
+
+    def add_response(self, content: str) -> None:
+        self._collector.add(AgentResponseStep(content=content))
+        self._final_response = content
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._token is not None:
+            _current.reset(self._token)
+            self._token = None
+
+        # Ship the trace
+        from latentspec.sdk.client import get_client
+
+        client = get_client()
+        if client is None or not self._collector.steps:
+            return
+        client.record(self._collector.to_trace())
+
+
+# ----- helpers ------------------------------------------------------------
+
+
+def _args_to_dict(
+    target: Callable[..., Any], args: tuple, kwargs: dict
+) -> dict[str, Any]:
+    try:
+        sig = inspect.signature(target)
+        bound = sig.bind_partial(*args, **kwargs)
+        bound.apply_defaults()
+        return {k: _safe_serialize(v) for k, v in bound.arguments.items()}
+    except (TypeError, ValueError):
+        return {**{f"arg_{i}": _safe_serialize(v) for i, v in enumerate(args)}, **{
+            k: _safe_serialize(v) for k, v in kwargs.items()
+        }}
+
+
+def _safe_serialize(value: Any) -> Any:
+    """Best-effort JSON-friendly conversion; truncate very large strings."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 2000 else value[:2000] + "…"
+    if isinstance(value, (list, tuple)):
+        return [_safe_serialize(v) for v in list(value)[:50]]
+    if isinstance(value, dict):
+        return {str(k): _safe_serialize(v) for k, v in list(value.items())[:50]}
+    return str(value)[:2000]
