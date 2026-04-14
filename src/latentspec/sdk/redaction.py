@@ -154,3 +154,160 @@ class HttpPresidioBackend(NerBackend):
     name = "presidio"
 
     def __init__(self, *, url: str, timeout: float = 1.5) -> None:
+        self._url = url.rstrip("/")
+        self._timeout = timeout
+
+    def detect(self, text: str) -> list[NerEntity]:
+        try:
+            import httpx
+
+            resp = httpx.post(
+                f"{self._url}/analyze",
+                json={"text": text, "language": "en"},
+                timeout=self._timeout,
+            )
+            if resp.status_code != 200:
+                return []
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001
+            log.debug("presidio backend error: %s", e)
+            return []
+        out: list[NerEntity] = []
+        for ent in data:
+            out.append(
+                NerEntity(
+                    label=str(ent.get("entity_type", "")),
+                    start=int(ent.get("start", 0)),
+                    end=int(ent.get("end", 0)),
+                )
+            )
+        return out
+
+
+# ---------------- Custom-redactor pipeline --------------------------------
+
+
+CustomRedactor = Callable[[str], str]
+
+
+@dataclass
+class Redactor:
+    enabled: bool = True
+    patterns: dict[str, Pattern[str]] = None  # type: ignore[assignment]
+    placeholder: str = "[redacted:{name}]"
+    custom_pipeline: list[CustomRedactor] = field(default_factory=list)
+    field_blocklist: frozenset[str] = frozenset(
+        {
+            "password", "auth_token", "api_key", "authorization",
+            "session_token", "private_key", "client_secret",
+            "credentials", "bearer_token",
+        }
+    )
+    ner_backends: list[NerBackend] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if self.patterns is None:
+            self.patterns = dict(_DEFAULT_PATTERNS)
+
+    def _apply_ner(self, value: str) -> str:
+        if not self.ner_backends:
+            return value
+        # Collect all spans from every backend, then mask longest-first to
+        # avoid index-shifting bugs.
+        spans: list[tuple[int, int, str]] = []
+        for backend in self.ner_backends:
+            try:
+                for ent in backend.detect(value):
+                    spans.append((ent.start, ent.end, ent.label.lower()))
+            except Exception as e:  # noqa: BLE001
+                log.debug("NER backend %s failed: %s", backend.name, e)
+        spans.sort(key=lambda s: (-(s[1] - s[0]), s[0]))
+
+        out = value
+        for start, end, label in spans:
+            placeholder = self.placeholder.format(name=label)
+            # Re-resolve indices in case earlier spans changed the length.
+            try:
+                # Replace only the first occurrence of the original substring.
+                slice_text = value[start:end]
+                if slice_text and slice_text in out:
+                    out = out.replace(slice_text, placeholder, 1)
+            except IndexError:
+                continue
+        return out
+
+    def redact_string(self, value: str) -> str:
+        if not value or not self.enabled:
+            return value
+        out = value
+        # 1) Pattern-based regex
+        for name, pattern in self.patterns.items():
+            out = pattern.sub(self.placeholder.format(name=name), out)
+        # 2) NER backends
+        out = self._apply_ner(out)
+        # 3) Custom pipeline
+        for fn in self.custom_pipeline:
+            try:
+                out = fn(out)
+            except Exception as e:  # noqa: BLE001
+                log.debug("custom redactor failed: %s", e)
+        return out
+
+    def redact_value(self, key: str | None, value: Any) -> Any:
+        if not self.enabled:
+            return value
+        if key is not None and key.lower() in self.field_blocklist:
+            return "[redacted:blocked_field]"
+        if isinstance(value, str):
+            return self.redact_string(value)
+        if isinstance(value, dict):
+            return {k: self.redact_value(str(k), v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self.redact_value(None, v) for v in value]
+        return value
+
+    def add_pattern(self, name: str, regex: str | Pattern[str]) -> None:
+        if isinstance(regex, str):
+            regex = re.compile(regex)
+        self.patterns[name] = regex
+
+    def add_custom_redactor(self, fn: CustomRedactor) -> None:
+        self.custom_pipeline.append(fn)
+
+    def add_ner_backend(self, backend: NerBackend) -> None:
+        self.ner_backends.append(backend)
+
+
+_default = Redactor()
+
+
+def get_default_redactor() -> Redactor:
+    return _default
+
+
+def redact_value(key: str | None, value: Any) -> Any:
+    return _default.redact_value(key, value)
+
+
+def redact_string(value: str) -> str:
+    return _default.redact_string(value)
+
+
+def configure(
+    *,
+    enabled: bool | None = None,
+    placeholder: str | None = None,
+    custom_redactors: list[CustomRedactor] | None = None,
+    field_blocklist: frozenset[str] | None = None,
+    ner_backends: list[NerBackend] | None = None,
+) -> None:
+    if enabled is not None:
+        _default.enabled = enabled
+    if placeholder is not None:
+        _default.placeholder = placeholder
+    if custom_redactors is not None:
+        _default.custom_pipeline = list(custom_redactors)
+    if field_blocklist is not None:
+        _default.field_blocklist = field_blocklist
+    if ner_backends is not None:
+        _default.ner_backends = list(ner_backends)
