@@ -115,3 +115,120 @@ def _mine_aggregates(
 
     Emits a STATISTICAL invariant (`metric=feature_envelope`) for every
     tool whose per-session count distribution is tight, e.g. "≤ 1
+    `payments_v2` call per session in 99% of sessions".
+    """
+    if not sessions:
+        return []
+
+    counts: dict[str, list[int]] = defaultdict(list)
+    for session in sessions:
+        per_tool: Counter[str] = Counter()
+        for trace in session.turns:
+            for step in trace.steps:
+                if isinstance(step, ToolCallStep):
+                    per_tool[step.tool] += 1
+        for tool, c in per_tool.items():
+            counts[tool].append(c)
+        # Also record zero-counts for tools seen in *other* sessions
+        for tool in counts:
+            if tool not in per_tool:
+                counts[tool].append(0)
+
+    out: list[InvariantCandidate] = []
+    n = len(sessions)
+    for tool, observations in counts.items():
+        if len(observations) < 10:
+            continue
+        observations_sorted = sorted(observations)
+        upper = observations_sorted[
+            min(len(observations_sorted) - 1, int(upper_bound_quantile * len(observations_sorted)))
+        ]
+        within = sum(1 for o in observations if o <= upper) / len(observations)
+        if within < min_consistency:
+            continue
+        out.append(
+            InvariantCandidate(
+                type=InvariantType.STATISTICAL,
+                description=(
+                    f"`{tool}` is invoked at most {upper} times per session "
+                    f"in {within:.0%} of sessions"
+                ),
+                formal_rule=(
+                    f"forall session: count(session.turns, "
+                    f"tool='{tool}') <= {upper}"
+                ),
+                evidence_trace_ids=[],
+                support=round(within, 4),
+                consistency=round(within, 4),
+                severity=Severity.MEDIUM,
+                discovered_by="statistical",
+                extra={
+                    "metric": "feature_envelope",
+                    "feature": f"session_count[{tool}]",
+                    "p1": 0.0,
+                    "p99": float(upper),
+                    "median": float(observations_sorted[len(observations_sorted) // 2]),
+                    "samples": len(observations),
+                    "session_level": True,
+                },
+            )
+        )
+    return out
+
+
+def _mine_terminations(
+    sessions: Sequence[Session],
+    *,
+    min_support: float = 0.6,
+) -> list[InvariantCandidate]:
+    """Fingerprint distribution of session-final turns."""
+    final_fps: Counter[str] = Counter()
+    n = max(1, len(sessions))
+    for session in sessions:
+        if session.turns:
+            final_fps[fingerprint(session.turns[-1])] += 1
+
+    out: list[InvariantCandidate] = []
+    for fp, c in final_fps.items():
+        support = c / n
+        if support < min_support:
+            continue
+        out.append(
+            InvariantCandidate(
+                type=InvariantType.STATE,
+                description=(
+                    f"Sessions terminate with a turn of shape `{fp[:8]}` "
+                    f"in {support:.0%} of sessions"
+                ),
+                formal_rule=(
+                    f"forall session: fp(session.turns[-1]) == '{fp}'"
+                ),
+                evidence_trace_ids=[],
+                support=round(support, 4),
+                consistency=round(support, 4),
+                severity=Severity.LOW,
+                discovered_by="statistical",
+                extra={
+                    "terminator_tool": f"fingerprint:{fp[:8]}",
+                    "forbidden_after": [],
+                    "session_level": True,
+                    "termination_fingerprint": fp,
+                },
+            )
+        )
+    return out
+
+
+def mine_session_invariants(
+    sessions: Sequence[Session],
+    *,
+    min_support: float = 0.4,
+) -> SessionMiningResult:
+    if not sessions:
+        return SessionMiningResult(n_sessions=0)
+    return SessionMiningResult(
+        n_sessions=len(sessions),
+        transitions=_mine_transitions(sessions, min_support=min_support),
+        aggregates=_mine_aggregates(sessions),
+        terminations=_mine_terminations(sessions, min_support=min_support),
+    )
