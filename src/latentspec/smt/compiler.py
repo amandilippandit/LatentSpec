@@ -192,3 +192,198 @@ def _compile_negative(params: dict[str, Any]) -> Z3Compilation:
         formula=formula,
         description=f"agent never invokes any of {patterns}",
     )
+
+
+def _compile_statistical(params: dict[str, Any]) -> Z3Compilation:
+    metric = params.get("metric")
+    tool = params.get("tool")
+    if not metric or not tool:
+        raise Z3CompilerError("statistical needs metric and tool")
+
+    s = _new_symbols()
+    t_id = _intern_tool(s, tool)
+    i = z3.Int("i")
+
+    if metric == "latency_ms":
+        threshold = int(params.get("threshold") or 0)
+        # forall i. tool(i) = T -> latency(i) <= threshold
+        formula = z3.ForAll(
+            [i],
+            z3.Implies(
+                z3.And(0 <= i, i < s.n, s.tool(i) == t_id),
+                s.latency(i) <= threshold,
+            ),
+        )
+        desc = f"latency(`{tool}`) <= {threshold}ms"
+    elif metric == "success_rate":
+        # Per-trace check: every invocation must succeed.
+        # The fleet-level rate is recomputed by the runner across traces.
+        formula = z3.ForAll(
+            [i],
+            z3.Implies(
+                z3.And(0 <= i, i < s.n, s.tool(i) == t_id),
+                s.success(i),
+            ),
+        )
+        desc = f"`{tool}` invocation must succeed"
+    else:
+        raise Z3CompilerError(f"unknown statistical metric: {metric!r}")
+
+    return Z3Compilation(
+        invariant_type=InvariantType.STATISTICAL,
+        params=params,
+        symbols=s,
+        formula=formula,
+        description=desc,
+    )
+
+
+def _compile_state(params: dict[str, Any]) -> Z3Compilation:
+    """State machine: after `terminator_tool`, the agent must not invoke
+    any of `forbidden_after`."""
+    terminator = params.get("terminator_tool")
+    forbidden_after = params.get("forbidden_after") or []
+    if not terminator or not forbidden_after:
+        raise Z3CompilerError("state needs terminator_tool and forbidden_after")
+
+    s = _new_symbols()
+    term_id = _intern_tool(s, terminator)
+    forbidden_ids = [_intern_tool(s, t) for t in forbidden_after]
+    i, j = z3.Ints("i j")
+
+    # forall i, j. tool(i) = terminator AND j > i -> tool(j) NOT IN forbidden_after
+    formula = z3.ForAll(
+        [i, j],
+        z3.Implies(
+            z3.And(
+                0 <= i, i < s.n, s.tool(i) == term_id,
+                i < j, j < s.n,
+            ),
+            z3.And(*(s.tool(j) != fid for fid in forbidden_ids)),
+        ),
+    )
+    return Z3Compilation(
+        invariant_type=InvariantType.STATE,
+        params=params,
+        symbols=s,
+        formula=formula,
+        description=f"after `{terminator}`, no calls to {forbidden_after}",
+    )
+
+
+def _compile_composition(params: dict[str, Any]) -> Z3Compilation:
+    """Multi-agent composition: tool A's first call must precede tool B's
+    last call. Maps cleanly onto the §3.3 example "Agent B waits for Agent A's
+    output" when traces are interleaved."""
+    upstream = params.get("upstream_tool")
+    downstream = params.get("downstream_tool")
+    if not upstream or not downstream:
+        raise Z3CompilerError("composition needs upstream_tool and downstream_tool")
+
+    s = _new_symbols()
+    u_id = _intern_tool(s, upstream)
+    d_id = _intern_tool(s, downstream)
+    i, j = z3.Ints("i j")
+
+    # forall i. tool(i) = downstream -> exists j < i. tool(j) = upstream
+    formula = z3.ForAll(
+        [i],
+        z3.Implies(
+            z3.And(0 <= i, i < s.n, s.tool(i) == d_id),
+            z3.Exists(
+                [j], z3.And(0 <= j, j < i, s.tool(j) == u_id)
+            ),
+        ),
+    )
+    return Z3Compilation(
+        invariant_type=InvariantType.COMPOSITION,
+        params=params,
+        symbols=s,
+        formula=formula,
+        description=f"every `{downstream}` call follows a `{upstream}` call",
+    )
+
+
+def _compile_tool_selection(params: dict[str, Any]) -> Z3Compilation:
+    """Segment-based routing: when segment matches `segment`, the agent must
+    use `expected_tool` instead of `forbidden_tool`."""
+    segment = params.get("segment")
+    expected_tool = params.get("expected_tool")
+    forbidden_tool = params.get("forbidden_tool")
+    if not segment or not expected_tool:
+        raise Z3CompilerError(
+            "tool_selection needs segment and expected_tool"
+        )
+
+    s = _new_symbols()
+    seg_id = _intern_keyword(s, f"segment:{segment}")
+    expected_id = _intern_tool(s, expected_tool)
+    forbidden_id = _intern_tool(s, forbidden_tool) if forbidden_tool else None
+    i = z3.Int("i")
+
+    # if segment(S) and any tool from {expected, forbidden} runs, it must be expected
+    if forbidden_id is not None:
+        formula = z3.Implies(
+            s.keyword(seg_id),
+            z3.ForAll(
+                [i],
+                z3.Implies(
+                    z3.And(0 <= i, i < s.n, s.tool(i) == forbidden_id),
+                    z3.BoolVal(False),
+                ),
+            ),
+        )
+    else:
+        formula = z3.Implies(
+            s.keyword(seg_id),
+            z3.Exists(
+                [i],
+                z3.And(0 <= i, i < s.n, s.tool(i) == expected_id),
+            ),
+        )
+
+    return Z3Compilation(
+        invariant_type=InvariantType.TOOL_SELECTION,
+        params=params,
+        symbols=s,
+        formula=formula,
+        description=f"segment {segment!r} routes to `{expected_tool}`",
+    )
+
+
+def _compile_output_format(params: dict[str, Any]) -> Z3Compilation:
+    """Output-format invariants are LLM-as-judge by design (§3.3); we still
+    emit a no-op Z3 placeholder so downstream consumers can iterate over
+    every type uniformly."""
+    s = _new_symbols()
+    return Z3Compilation(
+        invariant_type=InvariantType.OUTPUT_FORMAT,
+        params=params,
+        symbols=s,
+        formula=z3.BoolVal(True),
+        description="output_format — verified by LLM-as-judge, not Z3",
+    )
+
+
+_COMPILERS: dict[InvariantType, Callable[[dict[str, Any]], Z3Compilation]] = {
+    InvariantType.ORDERING: _compile_ordering,
+    InvariantType.CONDITIONAL: _compile_conditional,
+    InvariantType.NEGATIVE: _compile_negative,
+    InvariantType.STATISTICAL: _compile_statistical,
+    InvariantType.STATE: _compile_state,
+    InvariantType.COMPOSITION: _compile_composition,
+    InvariantType.TOOL_SELECTION: _compile_tool_selection,
+    InvariantType.OUTPUT_FORMAT: _compile_output_format,
+}
+
+
+def compiler_for(invariant_type: InvariantType) -> Callable[[dict[str, Any]], Z3Compilation]:
+    return _COMPILERS[invariant_type]
+
+
+def compile_invariant(
+    invariant_type: InvariantType, params: dict[str, Any]
+) -> Z3Compilation:
+    if invariant_type not in _COMPILERS:
+        raise Z3CompilerError(f"no Z3 compiler for {invariant_type}")
+    return _COMPILERS[invariant_type](dict(params))
