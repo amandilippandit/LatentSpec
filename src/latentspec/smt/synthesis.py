@@ -73,3 +73,79 @@ def synthesize_violating_trace(
     try:
         if solver.check() != z3.sat:
             return None
+        model = solver.model()
+    except z3.Z3Exception as e:
+        log.debug("synthesis Z3 failed: %s", e)
+        return None
+
+    return _decode(compilation, model, agent_id=agent_id, seed_user_input=seed_user_input)
+
+
+def _decode(
+    compilation: Z3Compilation,
+    model: z3.ModelRef,
+    *,
+    agent_id: str,
+    seed_user_input: str | None,
+) -> NormalizedTrace:
+    s = compilation.symbols
+    inverse_tools = {v: k for k, v in s.tool_ids.items()}
+
+    n_val = max(1, min(int(model.eval(s.n, model_completion=True).as_long()), 32))
+
+    steps: list[TraceStep] = []
+    if seed_user_input is not None:
+        steps.append(UserInputStep(content=seed_user_input))
+    elif s.keyword_ids:
+        # If the rule references a keyword, seed it into user_input so the
+        # decoded trace satisfies the precondition.
+        plain_keywords = [k for k in s.keyword_ids if not k.startswith("segment:")]
+        if plain_keywords:
+            steps.append(UserInputStep(content=" ".join(plain_keywords[:3])))
+
+    for i in range(n_val):
+        tid = int(model.eval(s.tool(i), model_completion=True).as_long())
+        if tid == 0:
+            continue  # non-tool slot
+        tool_name = inverse_tools.get(tid)
+        if tool_name is None:
+            continue
+        latency = int(model.eval(s.latency(i), model_completion=True).as_long())
+        success = bool(z3.is_true(model.eval(s.success(i), model_completion=True)))
+        steps.append(
+            ToolCallStep(
+                tool=tool_name,
+                args={},
+                latency_ms=max(0, latency),
+                result_status="success" if success else "error",
+            )
+        )
+
+    if not any(isinstance(s_, ToolCallStep) for s_ in steps):
+        # Empty model — fabricate a minimal violation trace using interned tools
+        # so the runtime guardrail has something to chew on.
+        for tool_name in list(inverse_tools.values())[:3]:
+            steps.append(ToolCallStep(tool=tool_name, args={}, latency_ms=10))
+
+    steps.append(AgentResponseStep(content="(synthesized adversarial trace)"))
+
+    # Determine segment from the model (only when tool_selection)
+    segment_value: str | None = None
+    for kw_label, kw_id in s.keyword_ids.items():
+        if not kw_label.startswith("segment:"):
+            continue
+        if z3.is_true(model.eval(s.keyword(kw_id), model_completion=True)):
+            segment_value = kw_label.split(":", 1)[1]
+            break
+
+    return NormalizedTrace(
+        trace_id=f"adversarial-{uuid.uuid4().hex[:10]}",
+        agent_id=agent_id,
+        timestamp=datetime.now(UTC),
+        ended_at=datetime.now(UTC),
+        steps=steps,
+        metadata=TraceMetadata(
+            model="latentspec.smt.synthesis",
+            user_segment=segment_value,
+        ),
+    )
