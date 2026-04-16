@@ -123,3 +123,129 @@ def _model_to_counter_example(
         n_val = model.eval(s.n, model_completion=True).as_long()
     except Exception:
         n_val = 0
+    n_val = max(0, min(n_val, 32))
+    steps: list[dict[str, Any]] = []
+    for i in range(n_val):
+        try:
+            tid = model.eval(s.tool(i), model_completion=True).as_long()
+            lat = model.eval(s.latency(i), model_completion=True).as_long()
+            ok = bool(z3.is_true(model.eval(s.success(i), model_completion=True)))
+        except Exception:
+            continue
+        steps.append(
+            {
+                "i": i,
+                "tool": inverse_tools.get(tid, "" if tid == 0 else f"tool#{tid}"),
+                "latency_ms": lat,
+                "success": ok,
+            }
+        )
+    return {"n": n_val, "steps": steps}
+
+
+def verify_symbolic(
+    compilation: Z3Compilation,
+    *,
+    max_length: int = 12,
+    max_tool_id: int = 64,
+    max_latency_ms: int = 60_000,
+    timeout_ms: int = 5000,
+    extra_assumptions: list[z3.BoolRef] | None = None,
+) -> SymbolicProof:
+    """Prove the invariant holds for *every* trace of length <= `max_length`.
+
+    Returns:
+        SymbolicProof with `proven=True` when Z3 returns unsat (i.e. there
+        is no model where `Not(formula)` holds), `proven=False` with a
+        decoded counter-example when sat. Z3 timeout / unknown returns
+        `proven=False` with `error` set so callers can distinguish
+        "definitely violatable" from "we couldn't decide".
+    """
+    start = time.perf_counter()
+
+    # Output_format invariants are LLM-as-judge by design; symbolic
+    # verification is meaningless for them.
+    if compilation.invariant_type == InvariantType.OUTPUT_FORMAT:
+        return SymbolicProof(
+            invariant_type=compilation.invariant_type,
+            proven=False,
+            duration_ms=0.0,
+            error="output_format invariants are not symbolically verifiable",
+        )
+
+    solver = z3.Solver()
+    solver.set("timeout", int(timeout_ms))
+
+    assumptions = _add_domain_constraints(
+        solver,
+        compilation,
+        max_length=max_length,
+        max_tool_id=max_tool_id,
+        max_latency_ms=max_latency_ms,
+    )
+
+    if extra_assumptions:
+        for c in extra_assumptions:
+            solver.add(c)
+            assumptions.append(
+                SymbolicAssumption(name="extra", value=str(c)[:240])
+            )
+
+    # Look for a model that satisfies the constraints AND violates the rule.
+    solver.add(z3.Not(compilation.formula))
+
+    try:
+        result = solver.check()
+    except z3.Z3Exception as e:
+        return SymbolicProof(
+            invariant_type=compilation.invariant_type,
+            proven=False,
+            duration_ms=round((time.perf_counter() - start) * 1000, 3),
+            error=f"z3_exception: {e}",
+            assumptions=assumptions,
+            max_trace_length=max_length,
+        )
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 3)
+    stats = _z3_stats(solver)
+
+    if result == z3.unsat:
+        return SymbolicProof(
+            invariant_type=compilation.invariant_type,
+            proven=True,
+            duration_ms=duration_ms,
+            assumptions=assumptions,
+            max_trace_length=max_length,
+            z3_statistics=stats,
+        )
+    if result == z3.sat:
+        try:
+            counter = _model_to_counter_example(solver.model(), compilation)
+        except Exception:
+            counter = None
+        return SymbolicProof(
+            invariant_type=compilation.invariant_type,
+            proven=False,
+            duration_ms=duration_ms,
+            counter_example=counter,
+            assumptions=assumptions,
+            max_trace_length=max_length,
+            z3_statistics=stats,
+        )
+    return SymbolicProof(
+        invariant_type=compilation.invariant_type,
+        proven=False,
+        duration_ms=duration_ms,
+        error="z3_unknown_or_timeout",
+        assumptions=assumptions,
+        max_trace_length=max_length,
+        z3_statistics=stats,
+    )
+
+
+def _z3_stats(solver: z3.Solver) -> dict[str, Any]:
+    try:
+        st = solver.statistics()
+        return {st.key(i): st.value(i) for i in range(len(st))}
+    except Exception:
+        return {}
