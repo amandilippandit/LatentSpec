@@ -127,3 +127,133 @@ def _instantiate(compilation: Z3Compilation, trace: NormalizedTrace) -> list[z3.
     constraints.append(
         z3.ForAll(
             [bound],
+            z3.Implies(
+                z3.Or(bound < 0, bound >= n_value),
+                z3.And(s.tool(bound) == 0, s.latency(bound) == 0),
+            ),
+        )
+    )
+
+    # Keyword facts
+    for kw, kw_id in s.keyword_ids.items():
+        if kw.startswith("segment:"):
+            seg_value = kw.split(":", 1)[1]
+            constraints.append(
+                s.keyword(kw_id) == (segment is not None and segment == seg_value)
+            )
+        else:
+            constraints.append(s.keyword(kw_id) == (kw.lower() in user_tokens))
+
+    return constraints
+
+
+def _extract_counter_example(
+    model: z3.ModelRef, compilation: Z3Compilation
+) -> dict[str, Any]:
+    s = compilation.symbols
+    out: dict[str, Any] = {}
+    try:
+        n = model.eval(s.n, model_completion=True).as_long()
+    except Exception:
+        return out
+    out["n"] = n
+    samples: list[dict[str, Any]] = []
+    inv_tool_ids = {v: k for k, v in s.tool_ids.items()}
+    for i in range(min(n, 16)):
+        try:
+            tid = model.eval(s.tool(i), model_completion=True).as_long()
+            lat = model.eval(s.latency(i), model_completion=True).as_long()
+            ok = bool(z3.is_true(model.eval(s.success(i), model_completion=True)))
+        except Exception:
+            continue
+        samples.append(
+            {
+                "i": i,
+                "tool": inv_tool_ids.get(tid, "" if tid == 0 else f"tool#{tid}"),
+                "latency_ms": lat,
+                "success": ok,
+            }
+        )
+    out["steps"] = samples
+    return out
+
+
+def verify_trace(
+    compilation: Z3Compilation,
+    trace: NormalizedTrace,
+    *,
+    timeout_ms: int = 100,
+) -> VerificationResult:
+    """Run Z3 against (compilation, trace).
+
+    Returns `holds=True` when the invariant is satisfied. `holds=False` plus
+    `counter_example` when violated. Z3 timeout returns `holds=True` with
+    `error="timeout"` so the streaming detector stays fail-open under load.
+    """
+    start = time.perf_counter()
+
+    with _Z3_LOCK:
+        solver = z3.Solver()
+        solver.set("timeout", int(max(1, timeout_ms)))
+
+        constraints = _instantiate(compilation, trace)
+        for c in constraints:
+            solver.add(c)
+
+        # Ask: can the formula be FALSE under these constraints?
+        solver.add(z3.Not(compilation.formula))
+
+        try:
+            result = solver.check()
+        except z3.Z3Exception as e:
+            log.debug("Z3 exception during verify: %s", e)
+            return VerificationResult(
+                invariant_type=compilation.invariant_type,
+                holds=True,
+                duration_ms=round((time.perf_counter() - start) * 1000, 3),
+                error=f"z3_exception: {e}",
+            )
+
+        duration_ms = round((time.perf_counter() - start) * 1000, 3)
+        if result == z3.unsat:
+            return VerificationResult(
+                invariant_type=compilation.invariant_type,
+                holds=True,
+                duration_ms=duration_ms,
+            )
+        if result == z3.sat:
+            try:
+                counter = _extract_counter_example(solver.model(), compilation)
+            except Exception:
+                counter = None
+            return VerificationResult(
+                invariant_type=compilation.invariant_type,
+                holds=False,
+                duration_ms=duration_ms,
+                counter_example=counter,
+            )
+        # unknown — treat as fail-open with explicit error
+        return VerificationResult(
+            invariant_type=compilation.invariant_type,
+            holds=True,
+            duration_ms=duration_ms,
+            error="z3_unknown_or_timeout",
+        )
+
+
+async def verify_trace_async(
+    compilation: Z3Compilation,
+    trace: NormalizedTrace,
+    *,
+    timeout_ms: int = 100,
+) -> VerificationResult:
+    """Async wrapper that pins Z3 work to the dedicated single-thread executor.
+
+    Use this from any asyncio context (streaming detector, certificate
+    generator, FastAPI handlers). Calling `verify_trace` directly from
+    `asyncio.to_thread` is unsafe because Python's default thread pool
+    will rotate Z3 calls across multiple OS threads.
+    """
+    loop = asyncio.get_running_loop()
+    fn = functools.partial(verify_trace, compilation, trace, timeout_ms=timeout_ms)
+    return await loop.run_in_executor(_Z3_EXECUTOR, fn)
