@@ -155,3 +155,161 @@ class CusumDetector:
         self.s_pos = 0.0
         self.s_neg = 0.0
         self.n = 0
+        self.fired = False
+        self.direction = None
+
+
+# ---------------- Per-rule registry --------------------------------------
+
+
+@dataclass
+class DriftEvent:
+    agent_id: str
+    invariant_id: str
+    detector: str  # "page-hinkley" | "cusum"
+    direction: str | None
+    n_observations: int
+    running_mean: float
+    cumulative_value: float
+    detected_at: float = field(default_factory=time.time)
+
+
+class DriftRegistry:
+    """Process-wide registry mapping (agent_id, invariant_id) -> detector pair.
+
+    Streaming detector calls `observe(agent_id, invariant_id, passed: bool)`
+    on every check. We track two metrics in parallel:
+      - pass-rate via Page-Hinkley (catches degradation)
+      - pass-rate via CUSUM with target=baseline (catches symmetric shift)
+
+    A `DriftEvent` is emitted the first time either fires; subsequent
+    observations are still recorded but don't re-fire until reset.
+    """
+
+    def __init__(
+        self,
+        *,
+        ph_threshold: float = 8.0,
+        ph_delta: float = 0.005,
+        cusum_slack: float = 0.05,
+        cusum_threshold: float = 4.0,
+        observation_window: int = 256,
+    ) -> None:
+        self._ph_kwargs = {"threshold": ph_threshold, "delta": ph_delta}
+        self._cusum_kwargs = {
+            "slack": cusum_slack,
+            "threshold": cusum_threshold,
+        }
+        self._window = observation_window
+        self._lock = threading.Lock()
+        self._page_hinkley: dict[tuple[str, str], PageHinkleyDetector] = {}
+        self._cusum: dict[tuple[str, str], CusumDetector] = {}
+        self._observations: dict[tuple[str, str], deque[float]] = {}
+        self._baseline: dict[tuple[str, str], float] = {}
+
+    def observe(
+        self, agent_id: str, invariant_id: str, passed: bool
+    ) -> list[DriftEvent]:
+        key = (agent_id, invariant_id)
+        value = 1.0 if passed else 0.0
+        events: list[DriftEvent] = []
+
+        with self._lock:
+            ph = self._page_hinkley.setdefault(
+                key, PageHinkleyDetector(**self._ph_kwargs)
+            )
+            cs = self._cusum.setdefault(key, CusumDetector(**self._cusum_kwargs))
+            obs = self._observations.setdefault(
+                key, deque(maxlen=self._window)
+            )
+            obs.append(value)
+
+            # Use the rolling mean as the CUSUM target until we've seen enough,
+            # then freeze the baseline.
+            if key not in self._baseline and len(obs) >= 64:
+                self._baseline[key] = sum(obs) / max(1, len(obs))
+                cs.target = self._baseline[key]
+            elif key not in self._baseline:
+                cs.target = sum(obs) / max(1, len(obs))
+
+            ph_fired = ph.update(value)
+            cs_fired = cs.update(value)
+
+            if ph_fired:
+                events.append(
+                    DriftEvent(
+                        agent_id=agent_id,
+                        invariant_id=invariant_id,
+                        detector="page-hinkley",
+                        direction="down",
+                        n_observations=ph.n,
+                        running_mean=ph.mean,
+                        cumulative_value=ph.cumsum - ph.min_cumsum,
+                    )
+                )
+            if cs_fired:
+                events.append(
+                    DriftEvent(
+                        agent_id=agent_id,
+                        invariant_id=invariant_id,
+                        detector="cusum",
+                        direction=cs.direction,
+                        n_observations=cs.n,
+                        running_mean=sum(obs) / max(1, len(obs)),
+                        cumulative_value=cs.s_pos if cs.direction == "up" else cs.s_neg,
+                    )
+                )
+        return events
+
+    def reset(
+        self, agent_id: str | None = None, invariant_id: str | None = None
+    ) -> None:
+        """Reset all detectors (call after re-mining), or just one
+        (agent_id, invariant_id) pair."""
+        with self._lock:
+            if agent_id is None and invariant_id is None:
+                self._page_hinkley.clear()
+                self._cusum.clear()
+                self._observations.clear()
+                self._baseline.clear()
+                return
+            keys = [
+                k
+                for k in list(self._page_hinkley)
+                if (agent_id is None or k[0] == agent_id)
+                and (invariant_id is None or k[1] == invariant_id)
+            ]
+            for k in keys:
+                self._page_hinkley.pop(k, None)
+                self._cusum.pop(k, None)
+                self._observations.pop(k, None)
+                self._baseline.pop(k, None)
+
+    def stats(self) -> dict[str, dict[str, float]]:
+        """Snapshot for `/metrics` / dashboards."""
+        with self._lock:
+            out: dict[str, dict[str, float]] = {}
+            for key, ph in self._page_hinkley.items():
+                kid = f"{key[0]}::{key[1]}"
+                out[kid] = {
+                    "ph_n": float(ph.n),
+                    "ph_mean": ph.mean,
+                    "ph_cumsum_excursion": ph.cumsum - ph.min_cumsum,
+                    "ph_fired": float(ph.fired),
+                }
+            return out
+
+
+_singleton: DriftRegistry | None = None
+
+
+def get_drift_registry() -> DriftRegistry:
+    global _singleton
+    if _singleton is None:
+        _singleton = DriftRegistry()
+    return _singleton
+
+
+def configure_for_test(registry: DriftRegistry | None) -> None:
+    global _singleton
+    _singleton = registry
