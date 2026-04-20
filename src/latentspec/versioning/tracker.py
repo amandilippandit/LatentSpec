@@ -69,3 +69,75 @@ async def register_or_update_version(
     new_tools = _trace_repertoire(trace)
 
     if row is None:
+        row = AgentVersion(
+            agent_id=agent_id,
+            version_tag=version_tag,
+            tool_repertoire=sorted(new_tools),
+            parent_version_tag=parent_version_tag,
+        )
+        db.add(row)
+        await db.flush()
+        return row
+
+    union = sorted(set(row.tool_repertoire or []) | new_tools)
+    if union != list(row.tool_repertoire or []):
+        row.tool_repertoire = union
+    row.last_seen_at = datetime.now(UTC)
+    return row
+
+
+async def resolve_active_version(
+    db: AsyncSession, *, agent_id: uuid.UUID
+) -> AgentVersion | None:
+    """Return the agent's most-recently-seen version row, or None."""
+    return (
+        await db.execute(
+            select(AgentVersion)
+            .where(AgentVersion.agent_id == agent_id)
+            .order_by(AgentVersion.last_seen_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def diff_versions(old: Iterable[str], new: Iterable[str]) -> VersionDelta:
+    """Tool-set diff with edit-distance-based rename detection."""
+    from latentspec.canonicalization.canonicalizer import _levenshtein, canonical_form
+
+    old_set = set(old)
+    new_set = set(new)
+    added = sorted(new_set - old_set)
+    removed = sorted(old_set - new_set)
+    common = sorted(old_set & new_set)
+
+    likely_renames: list[tuple[str, str]] = []
+    used_added: set[str] = set()
+    for old_name in removed:
+        best = None
+        best_dist = 999
+        old_canon = canonical_form(old_name)
+        for cand in added:
+            if cand in used_added:
+                continue
+            cand_canon = canonical_form(cand)
+            min_len = min(len(old_canon), len(cand_canon))
+            max_len = max(len(old_canon), len(cand_canon))
+            # Renames only meaningful for non-trivial names
+            if min_len < 4 or max_len < 4:
+                continue
+            d = _levenshtein(old_canon, cand_canon, max_distance=3)
+            # Relative threshold: edit distance ≤ 25% of the longer name AND
+            # an absolute floor of 2 so we don't flag random 1-char swaps.
+            if d <= 2 and d <= max(1, max_len // 4) and d < best_dist:
+                best_dist = d
+                best = cand
+        if best is not None:
+            likely_renames.append((old_name, best))
+            used_added.add(best)
+
+    return VersionDelta(
+        added=[a for a in added if a not in used_added],
+        removed=[r for r in removed if not any(r == old for old, _ in likely_renames)],
+        common=common,
+        likely_renames=likely_renames,
+    )
