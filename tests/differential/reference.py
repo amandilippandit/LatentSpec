@@ -93,3 +93,99 @@ def ref_negative(spec: InvariantSpec, trace: NormalizedTrace) -> CheckOutcome:
         for tool in tools_called:
             tool_lc = tool.lower()
             for pat in patterns_lower:
+                if pat in tool_lc:
+                    return CheckOutcome.FAIL
+        return CheckOutcome.PASS
+
+    return CheckOutcome.NOT_APPLICABLE
+
+
+def ref_state(spec: InvariantSpec, trace: NormalizedTrace) -> CheckOutcome:
+    terminator = spec.params.get("terminator_tool")
+    forbidden_after = set(spec.params.get("forbidden_after") or [])
+    if not terminator or not forbidden_after:
+        return CheckOutcome.NOT_APPLICABLE
+
+    seen_terminator = False
+    for s in trace.steps:
+        if not isinstance(s, ToolCallStep):
+            continue
+        if not seen_terminator and s.tool == terminator:
+            seen_terminator = True
+            continue
+        if seen_terminator and s.tool in forbidden_after:
+            return CheckOutcome.FAIL
+    return CheckOutcome.PASS if seen_terminator else CheckOutcome.NOT_APPLICABLE
+
+
+def ref_composition(spec: InvariantSpec, trace: NormalizedTrace) -> CheckOutcome:
+    upstream = spec.params.get("upstream_tool")
+    downstream = spec.params.get("downstream_tool")
+    if not upstream or not downstream:
+        return CheckOutcome.NOT_APPLICABLE
+
+    upstream_seen = False
+    saw_downstream = False
+    for s in trace.steps:
+        if not isinstance(s, ToolCallStep):
+            continue
+        if s.tool == upstream:
+            upstream_seen = True
+        elif s.tool == downstream:
+            saw_downstream = True
+            if not upstream_seen:
+                return CheckOutcome.FAIL
+    return CheckOutcome.PASS if saw_downstream else CheckOutcome.NOT_APPLICABLE
+
+
+def ref_tool_selection(spec: InvariantSpec, trace: NormalizedTrace) -> CheckOutcome:
+    segment = spec.params.get("segment")
+    expected = spec.params.get("expected_tool")
+    forbidden = spec.params.get("forbidden_tool")
+    if not segment or not expected:
+        return CheckOutcome.NOT_APPLICABLE
+
+    trace_segment = (trace.metadata.user_segment or "").lower()
+    if trace_segment != segment.lower():
+        return CheckOutcome.NOT_APPLICABLE
+
+    saw_expected = False
+    saw_forbidden = False
+    for s in trace.steps:
+        if not isinstance(s, ToolCallStep):
+            continue
+        if s.tool == expected:
+            saw_expected = True
+        elif forbidden and s.tool == forbidden:
+            saw_forbidden = True
+
+    if saw_forbidden:
+        return CheckOutcome.FAIL
+    if saw_expected:
+        return CheckOutcome.PASS
+    return CheckOutcome.NOT_APPLICABLE
+
+
+def ref_statistical(spec: InvariantSpec, trace: NormalizedTrace) -> CheckOutcome:
+    metric = spec.params.get("metric")
+    tool = spec.params.get("tool")
+    if not metric or not tool:
+        return CheckOutcome.NOT_APPLICABLE
+
+    matching = [s for s in trace.steps if isinstance(s, ToolCallStep) and s.tool == tool]
+    if not matching:
+        return CheckOutcome.NOT_APPLICABLE
+
+    if metric == "latency_ms":
+        threshold = float(spec.params.get("threshold") or 0.0)
+        if any((s.latency_ms or 0) > threshold for s in matching):
+            return CheckOutcome.WARN
+        return CheckOutcome.PASS
+
+    if metric == "success_rate":
+        rate = float(spec.params.get("rate") or 0.95)
+        ok = sum(1 for s in matching if (s.result_status or "success") == "success")
+        observed = ok / len(matching)
+        return CheckOutcome.PASS if observed >= rate else CheckOutcome.FAIL
+
+    return CheckOutcome.NOT_APPLICABLE
