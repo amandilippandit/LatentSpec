@@ -126,3 +126,132 @@ def normalized_trace(
             min_value=datetime(2025, 1, 1),
             max_value=datetime(2027, 1, 1),
         )
+    )
+    base = base_dt.replace(tzinfo=UTC)
+    return NormalizedTrace(
+        trace_id=draw(st.text(min_size=1, max_size=64)),
+        agent_id=draw(st.text(min_size=1, max_size=64)),
+        timestamp=base,
+        ended_at=base + timedelta(milliseconds=draw(st.integers(0, 60_000))),
+        steps=steps,
+        metadata=draw(trace_metadata),
+    )
+
+
+# ---- params strategies (one per InvariantType) ---------------------------
+
+
+def ordering_params() -> st.SearchStrategy:
+    return st.fixed_dictionaries({"tool_a": tool_name, "tool_b": tool_name}).filter(
+        lambda d: d["tool_a"] != d["tool_b"]
+    )
+
+
+def conditional_params() -> st.SearchStrategy:
+    return st.fixed_dictionaries({"keyword": keyword, "tool": tool_name})
+
+
+def negative_params() -> st.SearchStrategy:
+    """Either forbidden_patterns OR allowed_repertoire — never both."""
+    return st.one_of(
+        st.fixed_dictionaries(
+            {"forbidden_patterns": st.lists(tool_name, min_size=1, max_size=4)}
+        ),
+        st.fixed_dictionaries(
+            {"allowed_repertoire": st.lists(tool_name, min_size=1, max_size=8)}
+        ),
+    )
+
+
+def statistical_params() -> st.SearchStrategy:
+    latency = st.fixed_dictionaries(
+        {
+            "metric": st.just("latency_ms"),
+            "tool": tool_name,
+            "threshold": st.floats(min_value=0.0, max_value=60_000, allow_nan=False),
+        }
+    )
+    success = st.fixed_dictionaries(
+        {
+            "metric": st.just("success_rate"),
+            "tool": tool_name,
+            "rate": st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+        }
+    )
+    envelope = st.builds(
+        lambda f, p1, span: {
+            "metric": "feature_envelope",
+            "feature": f,
+            "p1": p1,
+            "p99": p1 + abs(span),
+        },
+        st.text(min_size=1, max_size=32),
+        st.floats(min_value=0.0, max_value=1000, allow_nan=False),
+        st.floats(min_value=0.1, max_value=1000, allow_nan=False),
+    )
+    return st.one_of(latency, success, envelope)
+
+
+def state_params() -> st.SearchStrategy:
+    return st.fixed_dictionaries(
+        {
+            "terminator_tool": tool_name,
+            "forbidden_after": st.lists(tool_name, min_size=1, max_size=4),
+        }
+    )
+
+
+def composition_params() -> st.SearchStrategy:
+    return st.fixed_dictionaries(
+        {"upstream_tool": tool_name, "downstream_tool": tool_name}
+    ).filter(lambda d: d["upstream_tool"] != d["downstream_tool"])
+
+
+def tool_selection_params() -> st.SearchStrategy:
+    return st.fixed_dictionaries(
+        {
+            "segment": segment,
+            "expected_tool": tool_name,
+            "forbidden_tool": tool_name,
+        }
+    ).filter(lambda d: d["expected_tool"] != d["forbidden_tool"])
+
+
+PARAMS_FOR = {
+    InvariantType.ORDERING: ordering_params(),
+    InvariantType.CONDITIONAL: conditional_params(),
+    InvariantType.NEGATIVE: negative_params(),
+    InvariantType.STATISTICAL: statistical_params(),
+    InvariantType.STATE: state_params(),
+    InvariantType.COMPOSITION: composition_params(),
+    InvariantType.TOOL_SELECTION: tool_selection_params(),
+}
+
+
+@st.composite
+def invariant_spec(draw, *, type_: InvariantType | None = None):
+    from latentspec.checking.base import InvariantSpec
+
+    chosen_type = type_ or draw(
+        st.sampled_from(
+            [
+                InvariantType.ORDERING,
+                InvariantType.CONDITIONAL,
+                InvariantType.NEGATIVE,
+                InvariantType.STATISTICAL,
+                InvariantType.STATE,
+                InvariantType.COMPOSITION,
+                InvariantType.TOOL_SELECTION,
+            ]
+        )
+    )
+    params = draw(PARAMS_FOR[chosen_type])
+    severity = draw(st.sampled_from(list(Severity)))
+    return InvariantSpec(
+        id=f"inv-{draw(st.integers(0, 10_000_000))}",
+        type=chosen_type,
+        description=draw(st.text(min_size=1, max_size=120)),
+        formal_rule="...",
+        severity=severity,
+        params=params,
+    )
