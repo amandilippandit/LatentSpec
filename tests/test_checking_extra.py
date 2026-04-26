@@ -80,3 +80,85 @@ def test_state_checker_not_applicable_without_terminator() -> None:
         {
             "terminator_tool": "session_close",
             "forbidden_after": ["read_user_data"],
+        },
+    )
+    trace = _trace([ToolCallStep(tool="read_user_data", args={})])
+    assert dispatch(inv, trace).outcome == CheckOutcome.NOT_APPLICABLE
+
+
+# ---- composition ---------------------------------------------------------
+
+
+def test_composition_pass_and_fail() -> None:
+    inv = _spec(
+        InvariantType.COMPOSITION,
+        {"upstream_tool": "agent_a_emit", "downstream_tool": "agent_b_consume"},
+    )
+    ok = _trace(
+        [
+            ToolCallStep(tool="agent_a_emit", args={}),
+            ToolCallStep(tool="agent_b_consume", args={}),
+        ]
+    )
+    bad = _trace(
+        [
+            ToolCallStep(tool="agent_b_consume", args={}),
+            ToolCallStep(tool="agent_a_emit", args={}),
+        ]
+    )
+    assert dispatch(inv, ok).outcome == CheckOutcome.PASS
+    assert dispatch(inv, bad).outcome == CheckOutcome.FAIL
+
+
+# ---- tool_selection ------------------------------------------------------
+
+
+def test_tool_selection_pass_for_matching_segment() -> None:
+    inv = _spec(
+        InvariantType.TOOL_SELECTION,
+        {
+            "segment": "EU",
+            "expected_tool": "payments_v2",
+            "forbidden_tool": "payments_v1",
+        },
+    )
+    trace = _trace(
+        [
+            UserInputStep(content="book flight"),
+            ToolCallStep(tool="payments_v2", args={}),
+        ],
+        segment="EU",
+    )
+    assert dispatch(inv, trace).outcome == CheckOutcome.PASS
+
+
+def test_tool_selection_fails_when_forbidden_used_in_segment() -> None:
+    inv = _spec(
+        InvariantType.TOOL_SELECTION,
+        {
+            "segment": "EU",
+            "expected_tool": "payments_v2",
+            "forbidden_tool": "payments_v1",
+        },
+    )
+    trace = _trace(
+        [ToolCallStep(tool="payments_v1", args={})],
+        segment="EU",
+    )
+    assert dispatch(inv, trace).outcome == CheckOutcome.FAIL
+
+
+def test_tool_selection_not_applicable_for_other_segment() -> None:
+    inv = _spec(
+        InvariantType.TOOL_SELECTION,
+        {
+            "segment": "EU",
+            "expected_tool": "payments_v2",
+            "forbidden_tool": "payments_v1",
+        },
+    )
+    trace = _trace(
+        [ToolCallStep(tool="payments_v1", args={})],
+        segment="US",
+    )
+    assert dispatch(inv, trace).outcome == CheckOutcome.NOT_APPLICABLE
