@@ -70,3 +70,76 @@ def test_guardrail_allows_after_satisfying_precondition() -> None:
 
 def test_guardrail_blocks_negative_violation() -> None:
     rules = RuleSet.from_invariants("agent-1", [_negative_rule()])
+
+    @guardrail(rules, fail_on="critical")
+    def delete_user(user_id: str) -> None:
+        return None
+
+    with pytest.raises(GuardrailViolation):
+        with guarded_turn(rules, user_input="please delete user 42"):
+            delete_user("42")
+
+
+def test_guardrail_fail_on_warn_does_not_raise() -> None:
+    rules = RuleSet.from_invariants("agent-1", [_ordering_rule(severity=Severity.MEDIUM)])
+
+    @guardrail(rules, fail_on="critical")  # critical-only — MEDIUM rule shouldn't block
+    def send_email(to: str) -> None:
+        return None
+
+    with guarded_turn(rules, user_input="email me"):
+        # Should not raise even though the rule is violated, because severity is MEDIUM
+        send_email("user@example.com")
+
+
+def test_guardrail_thread_isolation() -> None:
+    rules = RuleSet.from_invariants("agent-1", [_ordering_rule()])
+
+    @guardrail(rules, fail_on="critical")
+    def send_email(to: str) -> None:
+        return None
+
+    @guardrail(rules, fail_on="critical")
+    def auth() -> None:
+        return None
+
+    errors: list[BaseException] = []
+
+    def run_t1() -> None:
+        try:
+            with guarded_turn(rules, user_input="t1"):
+                auth()
+                send_email("a@x.com")
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    def run_t2() -> None:
+        try:
+            with guarded_turn(rules, user_input="t2"):
+                # No auth -> should violate
+                send_email("b@x.com")
+        except GuardrailViolation:
+            return
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+        else:
+            errors.append(AssertionError("t2 should have raised"))
+
+    th1 = threading.Thread(target=run_t1)
+    th2 = threading.Thread(target=run_t2)
+    th1.start(); th2.start()
+    th1.join(); th2.join()
+    assert errors == [], errors
+
+
+def test_ruleset_filter_by_severity() -> None:
+    rules = RuleSet.from_invariants(
+        "agent-1",
+        [
+            _ordering_rule(severity=Severity.CRITICAL),
+            _ordering_rule(severity=Severity.MEDIUM),
+        ],
+    )
+    high_only = rules.filter(min_severity=Severity.HIGH)
+    assert len(high_only) == 1
+    assert high_only[0].severity == Severity.CRITICAL
