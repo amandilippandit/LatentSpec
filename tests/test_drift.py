@@ -67,3 +67,72 @@ def test_cusum_detects_upward_shift() -> None:
 
 
 def test_drift_registry_isolates_per_invariant() -> None:
+    reg = DriftRegistry(ph_threshold=2.0, ph_delta=0.001)
+    # Invariant A drifts down
+    for _ in range(60):
+        reg.observe("agent-x", "inv-a", True)
+    events_a: list = []
+    for _ in range(40):
+        events_a.extend(reg.observe("agent-x", "inv-a", False))
+
+    # Invariant B stays clean
+    events_b: list = []
+    for _ in range(150):
+        events_b.extend(reg.observe("agent-x", "inv-b", True))
+
+    assert events_a, "A should have fired"
+    assert not events_b, "B should not fire — observations all 1.0"
+
+
+@pytest.mark.asyncio
+async def test_streaming_detector_records_drift_on_violation_burst() -> None:
+    """End-to-end: detector wired to drift registry catches a burst of
+    violations as drift, not just a single FAIL."""
+    inv = InvariantSpec(
+        id="inv-drift",
+        type=InvariantType.ORDERING,
+        description="auth before db_write",
+        formal_rule="...",
+        severity=Severity.CRITICAL,
+        params={"tool_a": "auth", "tool_b": "db_write"},
+    )
+    cache = InMemoryCache()
+    await cache.warm("agent-y", [inv])
+    drift_registry = DriftRegistry(ph_threshold=2.0, ph_delta=0.001)
+    det = StreamingDetector(cache=cache, drift_registry=drift_registry)
+
+    async def loader(_: str):
+        return [inv]
+
+    def good() -> NormalizedTrace:
+        return NormalizedTrace(
+            trace_id="t-good",
+            agent_id="agent-y",
+            timestamp=datetime.now(UTC),
+            steps=[
+                ToolCallStep(tool="auth", args={}),
+                ToolCallStep(tool="db_write", args={}),
+            ],
+            metadata=TraceMetadata(),
+        )
+
+    def bad() -> NormalizedTrace:
+        return NormalizedTrace(
+            trace_id="t-bad",
+            agent_id="agent-y",
+            timestamp=datetime.now(UTC),
+            steps=[ToolCallStep(tool="db_write", args={})],
+            metadata=TraceMetadata(),
+        )
+
+    for _ in range(50):
+        await det.check("agent-y", good(), loader=loader)
+
+    # Now feed a burst of violations
+    drift_observed = False
+    for _ in range(40):
+        sr = await det.check("agent-y", bad(), loader=loader)
+        if sr.drift_events:
+            drift_observed = True
+            break
+    assert drift_observed
