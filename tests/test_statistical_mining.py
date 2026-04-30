@@ -88,3 +88,93 @@ def test_associations_recover_keyword_to_tool() -> None:
     high lift, so the rule clears all three filters.
     """
     traces = []
+    for i in range(60):
+        if i % 2 == 0:
+            content = "I need a refund please"
+            tool = "escalate_human"
+        else:
+            content = "show me cheap flights to Tokyo"
+            tool = "search_flights"
+        traces.append(
+            _trace(
+                i,
+                [
+                    UserInputStep(content=content),
+                    ToolCallStep(tool=tool, args={}, latency_ms=150,
+                                 result_status="success"),
+                ],
+            )
+        )
+    candidates = mine_associations(traces)
+    refund_rule = next(
+        (c for c in candidates if c.extra.get("keyword") == "refund"),
+        None,
+    )
+    assert refund_rule is not None, "expected a 'refund' MI association"
+    assert refund_rule.extra["tool"] == "escalate_human"
+    # MI in bits should be substantial for this perfect-correlation case
+    assert refund_rule.extra["mutual_information_bits"] > 0.5
+    # chi-square far above the p<0.01 threshold
+    assert refund_rule.extra["chi_square"] > 20.0
+
+
+def test_negative_mining_emits_closed_world_repertoire() -> None:
+    """The closed-world miner emits a single negative invariant whose
+    `allowed_repertoire` is exactly the set of tools observed often
+    enough to clear the support threshold."""
+    from latentspec.mining.statistical.negative import CustomerPolicy
+
+    traces = []
+    for i in range(40):
+        traces.append(
+            _trace(
+                i,
+                [
+                    UserInputStep(content="hi"),
+                    ToolCallStep(
+                        tool="search_flights", args={}, latency_ms=120,
+                        result_status="success",
+                    ),
+                    ToolCallStep(
+                        tool="book_flight", args={}, latency_ms=200,
+                        result_status="success",
+                    ),
+                ],
+            )
+        )
+    candidates = mine_negatives(traces, min_traces=20)
+    closed_world = [
+        c for c in candidates
+        if c.extra.get("category") == "closed_world_repertoire"
+    ]
+    assert closed_world, "expected one closed-world repertoire invariant"
+    repertoire = set(closed_world[0].extra["allowed_repertoire"])
+    assert {"search_flights", "book_flight"} <= repertoire
+    assert closed_world[0].severity == Severity.CRITICAL
+
+
+def test_negative_mining_with_customer_denylist() -> None:
+    """Customer-supplied denylists emit alongside the closed-world rule."""
+    from latentspec.mining.statistical.negative import CustomerPolicy
+    from latentspec.models.invariant import Severity as Sev
+
+    traces = []
+    for i in range(40):
+        traces.append(
+            _trace(
+                i,
+                [
+                    UserInputStep(content="hi"),
+                    ToolCallStep(tool="search_flights", args={}, latency_ms=120),
+                ],
+            )
+        )
+    policy = CustomerPolicy(
+        denylist=[("delete_user", Sev.CRITICAL, "delete")],
+    )
+    candidates = mine_negatives(traces, min_traces=20, policy=policy)
+    delete_rule = next(
+        (c for c in candidates if c.extra.get("category") == "delete"), None
+    )
+    assert delete_rule is not None
+    assert "delete_user" in delete_rule.extra["forbidden_patterns"]
