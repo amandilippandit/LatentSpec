@@ -78,3 +78,83 @@ def test_z3_negative_fails_when_forbidden_present() -> None:
     )
     bad = _trace(
         [
+            UserInputStep(content="hi"),
+            ToolCallStep(tool="delete", args={}),
+        ]
+    )
+    assert not verify_trace(comp, bad, timeout_ms=2000).holds
+
+
+def test_z3_statistical_latency_holds_for_low_latency() -> None:
+    comp = compile_invariant(
+        InvariantType.STATISTICAL,
+        {"metric": "latency_ms", "tool": "search", "threshold": 500},
+    )
+    fast = _trace(
+        [
+            ToolCallStep(tool="search", args={}, latency_ms=200),
+            ToolCallStep(tool="search", args={}, latency_ms=300),
+        ]
+    )
+    slow = _trace(
+        [
+            ToolCallStep(tool="search", args={}, latency_ms=2000),
+        ]
+    )
+    assert verify_trace(comp, fast, timeout_ms=2000).holds
+    assert not verify_trace(comp, slow, timeout_ms=2000).holds
+
+
+def test_z3_state_invariant_after_terminator() -> None:
+    comp = compile_invariant(
+        InvariantType.STATE,
+        {
+            "terminator_tool": "session_close",
+            "forbidden_after": ["read_user_data", "write_user_data"],
+        },
+    )
+    ok = _trace(
+        [
+            ToolCallStep(tool="read_user_data", args={}),
+            ToolCallStep(tool="session_close", args={}),
+        ]
+    )
+    bad = _trace(
+        [
+            ToolCallStep(tool="session_close", args={}),
+            ToolCallStep(tool="read_user_data", args={}),
+        ]
+    )
+    assert verify_trace(comp, ok, timeout_ms=2000).holds
+    assert not verify_trace(comp, bad, timeout_ms=2000).holds
+
+
+def test_z3_compiler_rejects_bad_params() -> None:
+    try:
+        compile_invariant(InvariantType.ORDERING, {})
+    except Z3CompilerError:
+        return
+    raise AssertionError("expected Z3CompilerError on missing params")
+
+
+def test_certificate_generates_signature_when_key_set(monkeypatch) -> None:
+    monkeypatch.setenv("LATENTSPEC_CERT_SIGNING_KEY", "test-secret-1234567890")
+    comp = compile_invariant(
+        InvariantType.NEGATIVE, {"forbidden_patterns": ["delete"]}
+    )
+    sample = [
+        _trace(
+            [
+                ToolCallStep(tool="search_flights", args={}),
+                ToolCallStep(tool="book_flight", args={}),
+            ]
+        )
+        for _ in range(3)
+    ]
+    cert = generate_certificate(comp, sample, mode="combined", timeout_ms_per_trace=1000)
+    assert cert.empirical is not None
+    assert cert.empirical.sample_size == 3
+    assert cert.empirical.sample_holds == 3
+    assert cert.empirical.sample_violates == 0
+    assert cert.signature_hex is not None
+    assert len(cert.signature_hex) == 64  # SHA-256 hex
