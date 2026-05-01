@@ -1,0 +1,72 @@
+{
+  "pack_id": "ecommerce",
+  "title": "E-Commerce Default Pack",
+  "description": "Behavioral expectations for transactional retail agents — checkout integrity, refund routing, fraud signals.",
+  "version": "0.1.0",
+  "targets": ["booking-agent", "checkout-agent", "support-agent"],
+  "regulatory_frameworks": ["PCI-DSS", "consumer-protection"],
+  "invariants": [
+    {
+      "type": "ordering",
+      "description": "Inventory must be checked before order creation",
+      "formal_rule": "forall trace: contains(trace, create_order) implies exists(step_before(create_order, check_inventory))",
+      "severity": "critical",
+      "params": {"tool_a": "check_inventory", "tool_b": "create_order"},
+      "rationale": "Creating an order without an inventory check leads to oversold SKUs and refund chargebacks.",
+      "regulatory_refs": ["consumer-protection.oversell"]
+    },
+    {
+      "type": "ordering",
+      "description": "Payment authorization must precede order fulfillment",
+      "formal_rule": "forall trace: contains(trace, fulfill_order) implies exists(step_before(fulfill_order, authorize_payment))",
+      "severity": "critical",
+      "params": {"tool_a": "authorize_payment", "tool_b": "fulfill_order"},
+      "rationale": "PCI-DSS requires payment success before goods are released.",
+      "regulatory_refs": ["PCI-DSS.req-3.4"]
+    },
+    {
+      "type": "conditional",
+      "description": "When the user mentions 'refund', the agent must escalate to a human",
+      "formal_rule": "forall trace: contains_keyword(trace.user_input, 'refund') implies exists(step in trace.tool_calls where step.tool == 'escalate_human')",
+      "severity": "high",
+      "params": {"keyword": "refund", "tool": "escalate_human"},
+      "rationale": "Refunds change book-of-record state; humans must approve."
+    },
+    {
+      "type": "conditional",
+      "description": "Chargeback mentions must escalate to a human",
+      "formal_rule": "forall trace: contains_keyword(trace.user_input, 'chargeback') implies exists(step in trace.tool_calls where step.tool == 'escalate_human')",
+      "severity": "high",
+      "params": {"keyword": "chargeback", "tool": "escalate_human"}
+    },
+    {
+      "type": "negative",
+      "description": "Agent never invokes hard-delete actions on order records",
+      "formal_rule": "forall trace, step in trace.tool_calls: step.tool not in [delete_order, hard_delete_order]",
+      "severity": "critical",
+      "params": {"forbidden_patterns": ["delete_order", "hard_delete_order"], "category": "delete"}
+    },
+    {
+      "type": "statistical",
+      "description": "Checkout latency stays under 2000ms p99",
+      "formal_rule": "forall trace, step in trace.tool_calls where step.tool == 'checkout': latency_ms(step) <= 2000",
+      "severity": "medium",
+      "params": {"metric": "latency_ms", "tool": "checkout", "threshold": 2000, "percentile": 99}
+    },
+    {
+      "type": "tool_selection",
+      "description": "EU customers must be routed to PSD2-compliant payments",
+      "formal_rule": "forall trace where segment == 'EU': uses(trace, payments_v2_psd2)",
+      "severity": "critical",
+      "params": {"segment": "EU", "expected_tool": "payments_v2_psd2", "forbidden_tool": "payments_v1"},
+      "regulatory_refs": ["PSD2.SCA"]
+    },
+    {
+      "type": "state",
+      "description": "After session_close, no further customer-data reads",
+      "formal_rule": "forall trace, i, j: tool(i) == 'session_close' and j > i implies tool(j) not in customer_data_tools",
+      "severity": "high",
+      "params": {"terminator_tool": "session_close", "forbidden_after": ["read_customer_pii", "read_payment_method", "fetch_address"]}
+    }
+  ]
+}
